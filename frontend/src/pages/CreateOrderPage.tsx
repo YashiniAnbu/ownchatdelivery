@@ -16,12 +16,13 @@ export default function CreateOrderPage({ activeOrgId }: CreateOrderPageProps) {
   const [customerPhone, setCustomerPhone] = useState('');
   const [pickupLabel, setPickupLabel] = useState('Zafran Biryani House');
   const [dropLabel, setDropLabel] = useState('');
-  const [pickupLat, setPickupLat] = useState('13.0418');
-  const [pickupLng, setPickupLng] = useState('80.2341');
-  const [dropLat, setDropLat] = useState('13.0654');
-  const [dropLng, setDropLng] = useState('80.2398');
+  const [pickupLat, setPickupLat] = useState('');
+  const [pickupLng, setPickupLng] = useState('');
+  const [dropLat, setDropLat] = useState('');
+  const [dropLng, setDropLng] = useState('');
   const [cost, setCost] = useState('45');
   const [loading, setLoading] = useState(false);
+  const [resolveMessage, setResolveMessage] = useState('');
 
   const [unassignedDeliveries, setUnassignedDeliveries] = useState<IDelivery[]>([]);
   const [feedLoading, setFeedLoading] = useState(true);
@@ -39,16 +40,7 @@ export default function CreateOrderPage({ activeOrgId }: CreateOrderPageProps) {
   };
 
   const randomizeCoordinates = () => {
-    // Generate random coordinates within a rough bounding box of Chennai
-    const lat1 = (12.9 + Math.random() * 0.2).toFixed(4);
-    const lng1 = (80.1 + Math.random() * 0.2).toFixed(4);
-    const lat2 = (12.9 + Math.random() * 0.2).toFixed(4);
-    const lng2 = (80.1 + Math.random() * 0.2).toFixed(4);
-    
-    setPickupLat(lat1);
-    setPickupLng(lng1);
-    setDropLat(lat2);
-    setDropLng(lng2);
+    // No longer needed
   };
 
   useEffect(() => {
@@ -73,20 +65,34 @@ export default function CreateOrderPage({ activeOrgId }: CreateOrderPageProps) {
     }
 
     setLoading(true);
+    setResolveMessage('Resolving pickup location...');
     try {
-      await api.post('/delivery/create', {
+      // 1. Resolve Pickup Address
+      const pickupRes = await api.post('/trips/resolve-location', { address: pickupLabel });
+      const { lat: pLat, lng: pLng, formatted_address: pFormatted } = pickupRes.data;
+
+      setResolveMessage('Resolving drop location...');
+      // 2. Resolve Drop Address
+      const dropRes = await api.post('/trips/resolve-location', { address: dropLabel });
+      const { lat: dLat, lng: dLng, formatted_address: dFormatted } = dropRes.data;
+
+      setResolveMessage('Creating order...');
+      // 3. Create Delivery with resolved coordinates
+      await api.post('/trips', {
         ownchatOrgId: activeOrgId,
         provider: 'own_rider',
         customer: { name: customerName, phone: customerPhone },
         pickup: {
           label: pickupLabel,
-          latitude: parseFloat(pickupLat),
-          longitude: parseFloat(pickupLng)
+          latitude: pLat,
+          longitude: pLng,
+          formatted_address: pFormatted
         },
         drop: {
           label: dropLabel,
-          latitude: parseFloat(dropLat),
-          longitude: parseFloat(dropLng)
+          latitude: dLat,
+          longitude: dLng,
+          formatted_address: dFormatted
         },
         cost: parseFloat(cost)
       });
@@ -94,11 +100,12 @@ export default function CreateOrderPage({ activeOrgId }: CreateOrderPageProps) {
       setCustomerPhone('');
       setDropLabel('');
       setCost('45');
-      randomizeCoordinates();
+      setResolveMessage('');
       fetchUnassignedDeliveries();
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert('Failed to create order');
+      alert('Failed to create order: ' + (err.response?.data?.error || err.message));
+      setResolveMessage('');
     } finally {
       setLoading(false);
     }
@@ -190,60 +197,11 @@ export default function CreateOrderPage({ activeOrgId }: CreateOrderPageProps) {
                 </div>
               </div>
 
-              <div className="flex justify-between items-center mb-1.5 pt-2">
-                <Label className={labelCls}>Coordinates</Label>
-                <Button 
-                  type="button" 
-                  variant="outline"
-                  size="sm"
-                  onClick={randomizeCoordinates}
-                  className="h-7 text-[10px] px-2 gap-1"
-                >
-                  <RefreshCw size={10} /> Randomize
-                </Button>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-1">
-                  <Label className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Pickup Lat</Label>
-                  <Input
-                    type="text"
-                    required
-                    value={pickupLat}
-                    onChange={(e) => setPickupLat(e.target.value)}
-                    className="font-mono h-9"
-                  />
+              {resolveMessage && (
+                <div className="text-sm font-semibold text-blue-600 animate-pulse mt-2">
+                  {resolveMessage}
                 </div>
-                <div className="space-y-1">
-                  <Label className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Pickup Lng</Label>
-                  <Input
-                    type="text"
-                    required
-                    value={pickupLng}
-                    onChange={(e) => setPickupLng(e.target.value)}
-                    className="font-mono h-9"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Drop Lat</Label>
-                  <Input
-                    type="text"
-                    required
-                    value={dropLat}
-                    onChange={(e) => setDropLat(e.target.value)}
-                    className="font-mono h-9"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Drop Lng</Label>
-                  <Input
-                    type="text"
-                    required
-                    value={dropLng}
-                    onChange={(e) => setDropLng(e.target.value)}
-                    className="font-mono h-9"
-                  />
-                </div>
-              </div>
+              )}
 
               <div className="space-y-1.5 pt-2">
                 <Label className={labelCls}>Order Cost (₹) <span className="text-destructive">*</span></Label>

@@ -20,7 +20,13 @@ import { verifyToken } from './middleware/verifyToken';
 // Import workers and services
 import { startAssignmentWorker } from './workers/assignmentWorker';
 import { startSlaWorker } from './workers/slaWorker';
-import { setIOInstance } from './services/assignmentEngine';
+import { updateRiderLocation } from './services/redisGeoService';
+import Rider from './models/Rider';
+import { setIOInstance, emitToOrg } from './services/assignmentEngine';
+import Delivery from './models/Delivery';
+import TripLocationHistory from './models/TripLocationHistory';
+import redisClient from './config/redis';
+import { getPrecalculatedEstimate } from './services/precalcService';
 
 const app = express();
 const server = http.createServer(app);
@@ -54,7 +60,8 @@ app.use(verifyToken);
 // Protected API Endpoints
 app.use('/api/org', orgRoutes);
 app.use('/api/rider', riderRoutes);
-app.use('/api/delivery', deliveryRoutes);
+app.use('/api/trips', deliveryRoutes); // Updated as per prompt API surface
+app.use('/api/delivery', deliveryRoutes); // Backward compatibility for frontend
 app.use('/api/audit-logs', auditLogRoutes);
 app.use('/api/distance', distanceRoutes);
 
@@ -79,6 +86,87 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Customer or app joining a specific trip channel for live tracking
+  socket.on('join_trip', (tripId: string) => {
+    if (tripId) {
+      const room = `trip:${tripId}`;
+      socket.join(room);
+      console.log(`[Socket.io] Socket ${socket.id} joined room: ${room}`);
+    }
+  });
+
+  // Live Tracking ping from Rider (Section 8)
+  socket.on('rider:location', async (data: { riderId: string, lat: number, lng: number, heading?: number, speed?: number, tripId?: string }) => {
+    try {
+      console.log(`[LiveTracking] Received GPS ping from Rider ${data.riderId} - [${data.lat}, ${data.lng}] (Trip: ${data.tripId || 'None'})`);
+      const { updateRiderLocation, checkArrivalDistance } = require('./services/redisGeoService');
+      await updateRiderLocation(data.riderId, data.lat, data.lng, data.heading || 0, data.speed || 0);
+
+      if (data.tripId) {
+        io.to(`trip:${data.tripId}`).emit('location:update', {
+          riderId: data.riderId,
+          lat: data.lat,
+          lng: data.lng,
+          heading: data.heading,
+          speed: data.speed,
+          timestamp: new Date()
+        });
+
+        const delivery = await Delivery.findById(data.tripId);
+        if (delivery) {
+          // Auto-Arrival Trigger
+          if (delivery.status === 'RIDER_EN_ROUTE_TO_PICKUP') {
+             const distStr = await checkArrivalDistance(data.riderId, data.tripId, delivery.pickup.latitude, delivery.pickup.longitude);
+             if (distStr !== null && distStr <= 50) {
+                 console.log(`[GeoTrigger] Rider ${data.riderId} within 50m of pickup for trip ${data.tripId}. Auto-arriving.`);
+                 delivery.status = 'ARRIVED_AT_PICKUP';
+                 delivery.milestones.atPickupAt = new Date();
+                 await delivery.save();
+                 emitToOrg(delivery.ownchatOrgId.toString(), 'delivery_status_updated', {
+                    orderId: delivery.id, status: 'ARRIVED_AT_PICKUP', timestamp: new Date()
+                 });
+                 io.to(`trip:${data.tripId}`).emit('trip:status', {
+                    orderId: delivery.id, status: 'ARRIVED_AT_PICKUP', timestamp: new Date()
+                 });
+             }
+          }
+
+          // Breadcrumb Throttle (30s)
+          const breadcrumbKey = `trip:${data.tripId}:last_breadcrumb`;
+          const canSave = await redisClient.set(breadcrumbKey, '1', 'EX', 30, 'NX');
+          if (canSave) {
+             await TripLocationHistory.create({
+                 deliveryId: delivery._id,
+                 lat: data.lat,
+                 lng: data.lng,
+                 recorded_at: new Date()
+             });
+          }
+
+          // ETA Recalculation Throttle (60s)
+          if (['RIDER_EN_ROUTE_TO_PICKUP', 'IN_TRIP'].includes(delivery.status)) {
+             const etaKey = `trip:${data.tripId}:last_eta_calc`;
+             const canCalcEta = await redisClient.set(etaKey, '1', 'EX', 60, 'NX');
+             if (canCalcEta) {
+                const destLat = delivery.status === 'IN_TRIP' ? delivery.drop.latitude : delivery.pickup.latitude;
+                const destLng = delivery.status === 'IN_TRIP' ? delivery.drop.longitude : delivery.pickup.longitude;
+                const precalc = await getPrecalculatedEstimate(data.lat, data.lng, destLat, destLng);
+                if (precalc) {
+                   io.to(`trip:${data.tripId}`).emit('eta:update', {
+                      duration_seconds: precalc.duration_seconds,
+                      distance_meters: precalc.distance_meters,
+                      timestamp: new Date()
+                   });
+                }
+             }
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[Socket.io] Error updating rider location:', err);
+    }
+  });
+
   socket.on('disconnect', () => {
     console.log(`[Socket.io] Client disconnected: ${socket.id}`);
   });
@@ -90,12 +178,29 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/ownchat_de
 
 console.log(`[Database] Connecting to MongoDB: ${MONGO_URI}...`);
 mongoose.connect(MONGO_URI)
-  .then(() => {
+  .then(async () => {
     console.log('[Database] MongoDB connected successfully.');
     
     // Start background workers
     startAssignmentWorker();
     startSlaWorker();
+    
+    // Sync On-Duty riders to Redis on startup
+    try {
+      const activeRiders = await Rider.find({ isOnDuty: true });
+      for (const r of activeRiders) {
+        if (r.lastKnownLocation && r.lastKnownLocation.latitude && r.lastKnownLocation.longitude) {
+          await updateRiderLocation(r.id.toString(), r.lastKnownLocation.latitude, r.lastKnownLocation.longitude, 0, 0);
+        }
+      }
+      console.log(`[App] Synced ${activeRiders.length} on-duty riders to Redis.`);
+    } catch (err) {
+      console.error('[App] Failed to sync riders to Redis on startup:', err);
+    }
+
+    // Start Cron Jobs
+    const { startCronJobs } = require('./cron');
+    startCronJobs();
 
     // Start HTTP Server
     server.listen(PORT, () => {

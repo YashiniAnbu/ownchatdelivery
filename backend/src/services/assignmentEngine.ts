@@ -2,10 +2,15 @@ import { Types } from 'mongoose';
 import Org from '../models/Org';
 import Rider from '../models/Rider';
 import Delivery from '../models/Delivery';
-import { IDelivery, IOrg, IRider, AssignmentStrategy, AssignmentStatus, Provider } from '../types';
+import RiderLoadScore from '../models/RiderLoadScore';
+import RoundRobinState from '../models/RoundRobinState';
+import { getNearbyRiders } from './redisGeoService';
+import { isRedisReady } from '../config/redis';
+import { getDistanceMatrix } from './distanceMatrixService';
+import { getPrecalculatedEstimate } from './precalcService';
 import { calculateDistance } from './haversine';
+import { IDelivery, IOrg, IRider, AssignmentStrategy } from '../types';
 
-// Socket notifier helper
 let ioInstance: any = null;
 export function setIOInstance(io: any) {
   ioInstance = io;
@@ -26,29 +31,93 @@ export function emitToDispatchers(orgId: string, event: string, data: any) {
   }
 }
 
-/**
- * Filters and retrieves the list of eligible riders for an organization
- */
-export async function getEligibleRiders(orgId: string, org: IOrg, excludedRiderIds: string[] = []): Promise<IRider[]> {
-  const maxLoad = org.ownRiderConfig.maxConcurrentOrdersPerRider;
-  
-  return Rider.find({
+export function emitToTrip(tripId: string, event: string, data: any) {
+  const room = `trip:${tripId}`;
+  console.log(`[Socket.io] Emitting ${event} to trip room ${room}`, data);
+  if (ioInstance) {
+    ioInstance.to(room).emit(event, data);
+  }
+}
+
+export async function getShortlistedRiders(orgId: string, org: IOrg, pickupLat: number, pickupLng: number, excludedRiderIds: string[] = []): Promise<{ rider: IRider, distanceRedisKm: number }[]> {
+  const maxLoad = org.ownRiderConfig.maxConcurrentOrdersPerRider || 3;
+  const searchRadiusKm = 5000; // Large radius for testing
+
+  // ── Strategy 1: Try Redis GEOSEARCH first (fast path) ──
+  let nearby: { riderId: string; distance: number }[] = [];
+  try {
+    if (isRedisReady()) {
+      nearby = await getNearbyRiders(pickupLat, pickupLng, searchRadiusKm);
+      console.log(`[Assignment] Redis GEOSEARCH returned ${nearby.length} riders`);
+    } else {
+      console.warn('[Assignment] Redis not ready, skipping GEOSEARCH');
+    }
+  } catch (err) {
+    console.warn('[Assignment] Redis GEOSEARCH failed, falling back to MongoDB:', (err as Error).message);
+  }
+
+  if (nearby.length > 0) {
+    const candidateIds = nearby
+      .filter(n => !excludedRiderIds.includes(n.riderId))
+      .map(n => n.riderId);
+
+    const riders = await Rider.find({
+      ownchatOrgId: orgId,
+      _id: { $in: candidateIds },
+      isActive: true,
+      isOnDuty: true,
+      'stats.activeDeliveries': { $lt: maxLoad }
+    });
+
+    if (riders.length > 0) {
+      return riders.map(rider => {
+        const geoInfo = nearby.find(n => n.riderId === rider.id.toString());
+        return {
+          rider,
+          distanceRedisKm: geoInfo ? geoInfo.distance : Infinity
+        };
+      });
+    }
+  }
+
+  // ── Strategy 2: MongoDB fallback (when Redis is empty/down) ──
+  console.log('[Assignment] Using MongoDB fallback to find eligible riders');
+  const riders = await Rider.find({
     ownchatOrgId: orgId,
-    _id: { $nin: excludedRiderIds },
+    isActive: true,
+    isOnDuty: true,
+    'stats.activeDeliveries': { $lt: maxLoad },
+    _id: { $nin: excludedRiderIds }
+  });
+
+  return riders.map(rider => {
+    let distKm = Infinity;
+    if (rider.lastKnownLocation?.latitude && rider.lastKnownLocation?.longitude) {
+      distKm = calculateDistance(
+        pickupLat, pickupLng,
+        rider.lastKnownLocation.latitude,
+        rider.lastKnownLocation.longitude
+      );
+    }
+    return { rider, distanceRedisKm: distKm };
+  }).sort((a, b) => a.distanceRedisKm - b.distanceRedisKm);
+}
+
+export async function getEligibleRiders(orgId: string, org: IOrg): Promise<IRider[]> {
+  const maxLoad = org.ownRiderConfig.maxConcurrentOrdersPerRider || 3;
+  return await Rider.find({
+    ownchatOrgId: orgId,
     isActive: true,
     isOnDuty: true,
     'stats.activeDeliveries': { $lt: maxLoad }
   });
 }
 
-/**
- * Triggers external provider fallback dispatch
- */
 export async function triggerExternalFallback(delivery: IDelivery, org: IOrg) {
   const provider = org.ownRiderConfig.fallbackProvider || 'porter';
   
   delivery.provider = provider;
-  delivery.status = 'unassigned'; // or standard unassigned for external API integration
+  delivery.status = 'unassigned';
   delivery.ownRiderAssignment.assignmentStatus = 'unassigned';
   delivery.ownRiderAssignment.riderId = null;
   delivery.ownRiderAssignment.riderName = null;
@@ -63,9 +132,6 @@ export async function triggerExternalFallback(delivery: IDelivery, org: IOrg) {
   });
 }
 
-/**
- * Core engine: analyzes active strategy and schedules assignment
- */
 export async function assignRider(delivery: IDelivery): Promise<void> {
   try {
     const org = await Org.findById(delivery.ownchatOrgId);
@@ -98,17 +164,16 @@ export async function assignRider(delivery: IDelivery): Promise<void> {
       .filter(c => c.result === 'rejected' || c.result === 'timeout')
       .map(c => c.riderId.toString());
 
-    // Run eligibility filtering
-    let eligibleRiders = await getEligibleRiders(org.id, org, previouslyRejectedRiderIds);
+    let shortlisted = await getShortlistedRiders(org.id, org, delivery.pickup.latitude, delivery.pickup.longitude, previouslyRejectedRiderIds);
 
-    if (eligibleRiders.length === 0) {
+    if (shortlisted.length === 0) {
       delivery.status = 'unassigned';
       delivery.ownRiderAssignment.assignmentStatus = 'unassigned';
       await delivery.save();
 
       emitToOrg(org.id, 'own_rider_no_available', {
         orderId: delivery.id,
-        message: 'No eligible riders available in the fleet.',
+        message: 'No eligible riders available in the fleet near pickup.',
         timestamp: new Date()
       });
 
@@ -118,105 +183,136 @@ export async function assignRider(delivery: IDelivery): Promise<void> {
       return;
     }
 
-    // Rank based on active strategy
-    let rankedRiders: { rider: IRider; distanceKm: number | null }[] = [];
+    let rankedRiders: { rider: IRider; distanceKm: number | null, eta?: number | null }[] = [];
 
     if (strategy === 'nearest') {
-      const pickupLat = delivery.pickup.latitude;
-      const pickupLng = delivery.pickup.longitude;
-
-      rankedRiders = eligibleRiders.map((rider) => {
-        const riderLat = rider.lastKnownLocation?.latitude;
-        const riderLng = rider.lastKnownLocation?.longitude;
-
-        if (riderLat === null || riderLng === null || riderLat === undefined || riderLng === undefined) {
-          return { rider, distanceKm: Infinity }; // No location, place last
-        }
-
-        const dist = calculateDistance(pickupLat, pickupLng, riderLat, riderLng);
-        return { rider, distanceKm: dist };
-      });
-
-      rankedRiders.sort((a, b) => {
-        if (a.distanceKm === Infinity && b.distanceKm === Infinity) return 0;
-        if (a.distanceKm === Infinity) return 1;
-        if (b.distanceKm === Infinity) return -1;
-        return a.distanceKm! - b.distanceKm!;
-      });
+      const origins = shortlisted.map(s => ({
+        lat: s.rider.lastKnownLocation?.latitude || 0,
+        lng: s.rider.lastKnownLocation?.longitude || 0
+      }));
+      const dest = { lat: delivery.pickup.latitude, lng: delivery.pickup.longitude };
+      
+      try {
+        const matrixResults = await getDistanceMatrix(origins, dest);
+        rankedRiders = shortlisted.map((s, idx) => ({
+          rider: s.rider,
+          distanceKm: s.distanceRedisKm,
+          eta: matrixResults[idx]?.duration_in_traffic?.value || null
+        })).sort((a, b) => (a.eta || Infinity) - (b.eta || Infinity));
+      } catch (err) {
+        console.error('Distance Matrix failed, falling back to precalc/GEO distance', err);
+        
+        const rankedWithPrecalc = await Promise.all(shortlisted.map(async (s) => {
+          const originLat = s.rider.lastKnownLocation?.latitude || 0;
+          const originLng = s.rider.lastKnownLocation?.longitude || 0;
+          const precalc = await getPrecalculatedEstimate(originLat, originLng, dest.lat, dest.lng);
+          return {
+            rider: s.rider,
+            distanceKm: s.distanceRedisKm,
+            eta: precalc ? precalc.duration_seconds : (s.distanceRedisKm * 100) // Rough fallback
+          };
+        }));
+        
+        rankedRiders = rankedWithPrecalc.sort((a, b) => a.eta - b.eta)
+                                        .map(r => ({ rider: r.rider, distanceKm: r.distanceKm }));
+      }
     } else if (strategy === 'round_robin') {
-      rankedRiders = eligibleRiders.map((rider) => ({ rider, distanceKm: null }));
+      const roundRobinState = await RoundRobinState.findOne({ zone_id: org.id });
+      const lastAssignedId = roundRobinState?.last_assigned_rider_id?.toString();
+      
+      rankedRiders = shortlisted.map(s => ({ rider: s.rider, distanceKm: s.distanceRedisKm, eta: null }));
       rankedRiders.sort((a, b) => {
         const timeA = a.rider.lastAssignedAt ? a.rider.lastAssignedAt.getTime() : 0;
         const timeB = b.rider.lastAssignedAt ? b.rider.lastAssignedAt.getTime() : 0;
-        return timeA - timeB; // Oldest goes first
-      });
-    } else if (strategy === 'load_balanced') {
-      rankedRiders = eligibleRiders.map((rider) => ({ rider, distanceKm: null }));
-      rankedRiders.sort((a, b) => {
-        const loadA = a.rider.stats.activeDeliveries;
-        const loadB = b.rider.stats.activeDeliveries;
-        
-        if (loadA !== loadB) {
-          return loadA - loadB; // Fewest active orders first
-        }
-        
-        const timeA = a.rider.lastAssignedAt ? a.rider.lastAssignedAt.getTime() : 0;
-        const timeB = b.rider.lastAssignedAt ? b.rider.lastAssignedAt.getTime() : 0;
-        return timeA - timeB; // Tie-break: round-robin
-      });
-    } else if (strategy === 'hybrid') {
-      const pickupLat = delivery.pickup.latitude;
-      const pickupLng = delivery.pickup.longitude;
-      const W1 = parseFloat(process.env.WEIGHT_DISTANCE || '0.5');
-      const W2 = parseFloat(process.env.WEIGHT_LOAD || '0.3');
-      const W3 = parseFloat(process.env.WEIGHT_FAIRNESS || '0.2');
-      const MAX_DECAY_HOURS = 4;
-      const now = Date.now();
-
-      const ridersWithDistance = eligibleRiders.map((rider) => {
-        const rLat = rider.lastKnownLocation?.latitude;
-        const rLng = rider.lastKnownLocation?.longitude;
-        if (rLat === null || rLng === null || rLat === undefined || rLng === undefined) {
-          return { rider, distanceKm: Infinity };
-        }
-        const dist = calculateDistance(pickupLat, pickupLng, rLat, rLng);
-        return { rider, distanceKm: dist };
-      });
-
-      const validDistances = ridersWithDistance.map(r => r.distanceKm).filter((d): d is number => d !== Infinity && d !== null);
-      const maxDist = validDistances.length > 0 ? Math.max(...validDistances, 0.001) : 1;
-
-      const ridersWithScores = ridersWithDistance.map((item) => {
-        const normalizedDistance = item.distanceKm === Infinity ? 1 : item.distanceKm / maxDist;
-        const maxConcurrent = org.ownRiderConfig.maxConcurrentOrdersPerRider || 3;
-        const normalizedLoad = item.rider.stats.activeDeliveries / maxConcurrent;
-
-        let roundRobinPenalty = 0;
-        if (item.rider.lastAssignedAt) {
-          const hoursSince = (now - new Date(item.rider.lastAssignedAt).getTime()) / (1000 * 60 * 60);
-          roundRobinPenalty = Math.max(0, 1 - (hoursSince / MAX_DECAY_HOURS));
-        }
-
-        const score = (W1 * normalizedDistance) + (W2 * normalizedLoad) + (W3 * roundRobinPenalty);
-        return { ...item, score };
-      });
-
-      ridersWithScores.sort((a, b) => {
-        if (a.score !== b.score) {
-          return a.score - b.score;
-        }
-        const timeA = a.rider.lastAssignedAt ? new Date(a.rider.lastAssignedAt).getTime() : 0;
-        const timeB = b.rider.lastAssignedAt ? new Date(b.rider.lastAssignedAt).getTime() : 0;
         return timeA - timeB;
       });
+      
+      if (lastAssignedId) {
+        const lastIdx = rankedRiders.findIndex(r => r.rider.id.toString() === lastAssignedId);
+        if (lastIdx !== -1) {
+          const shifted = rankedRiders.splice(0, lastIdx + 1);
+          rankedRiders = [...rankedRiders, ...shifted];
+        }
+      }
+    } else if (strategy === 'load_balanced') {
+      const loadScores = await RiderLoadScore.find({ riderId: { $in: shortlisted.map(s => s.rider._id) } });
+      const scoreMap = new Map(loadScores.map(ls => [ls.riderId.toString(), ls.active_trip_count]));
 
-      rankedRiders = ridersWithScores.map(item => ({ rider: item.rider, distanceKm: item.distanceKm }));
+      rankedRiders = shortlisted.map(s => ({ rider: s.rider, distanceKm: s.distanceRedisKm }));
+      
+      const origins = shortlisted.map(s => ({
+        lat: s.rider.lastKnownLocation?.latitude || 0,
+        lng: s.rider.lastKnownLocation?.longitude || 0
+      }));
+      const dest = { lat: delivery.pickup.latitude, lng: delivery.pickup.longitude };
+      let matrixResults: any[] = [];
+      try {
+        matrixResults = await getDistanceMatrix(origins, dest);
+      } catch (err) {
+        console.error('Distance Matrix failed in load_balanced, using precalc/GEO');
+      }
+
+      const rankedWithScores = await Promise.all(rankedRiders.map(async (item, idx) => {
+        let eta = matrixResults[idx]?.duration_in_traffic?.value;
+        if (!eta) {
+           const originLat = item.rider.lastKnownLocation?.latitude || 0;
+           const originLng = item.rider.lastKnownLocation?.longitude || 0;
+           const precalc = await getPrecalculatedEstimate(originLat, originLng, dest.lat, dest.lng);
+           eta = precalc ? precalc.duration_seconds : ((item.distanceKm || 1) * 100);
+        }
+        
+        const load = scoreMap.get(item.rider.id.toString()) || 0;
+        const score = (eta * 0.4) + (load * 0.6); // basic weighted score
+        return { ...item, score };
+      }));
+      
+      rankedWithScores.sort((a, b) => a.score - b.score);
+      rankedRiders = rankedWithScores.map(r => ({ rider: r.rider, distanceKm: r.distanceKm, eta: r.eta }));
+    } else {
+      // Hybrid strategy - use robust scoring system
+      const loadScores = await RiderLoadScore.find({ riderId: { $in: shortlisted.map(s => s.rider._id) } });
+      const scoreMap = new Map(loadScores.map(ls => [ls.riderId.toString(), ls.active_trip_count]));
+
+      const origins = shortlisted.map(s => ({
+        lat: s.rider.lastKnownLocation?.latitude || 0,
+        lng: s.rider.lastKnownLocation?.longitude || 0
+      }));
+      const dest = { lat: delivery.pickup.latitude, lng: delivery.pickup.longitude };
+      
+      let matrixResults: any[] = [];
+      try {
+        matrixResults = await getDistanceMatrix(origins, dest);
+      } catch (err) {
+        console.error('Distance Matrix failed in hybrid, using precalc/GEO');
+      }
+
+      const rankedWithScores = await Promise.all(shortlisted.map(async (item, idx) => {
+        let eta = matrixResults[idx]?.duration_in_traffic?.value;
+        if (!eta) {
+           const originLat = item.rider.lastKnownLocation?.latitude || 0;
+           const originLng = item.rider.lastKnownLocation?.longitude || 0;
+           const precalc = await getPrecalculatedEstimate(originLat, originLng, dest.lat, dest.lng);
+           eta = precalc ? precalc.duration_seconds : ((item.distanceRedisKm || 1) * 100);
+        }
+        
+        const load = scoreMap.get(item.rider.id.toString()) || 0;
+        const distanceScore = eta * 0.4;
+        const loadScoreCalc = load * 60 * 0.6; // Scale load appropriately
+        const fairnessScore = item.rider.lastAssignedAt ? (Date.now() - item.rider.lastAssignedAt.getTime()) / 60000 : 0; // minutes since last assigned
+  
+        const totalScore = distanceScore + loadScoreCalc - (fairnessScore * 0.1); // lower is better
+        
+        return { rider: item.rider, distanceKm: item.distanceRedisKm, eta, score: totalScore };
+      }));
+      
+      rankedWithScores.sort((a, b) => a.score - b.score);
+      rankedRiders = rankedWithScores.map(r => ({ rider: r.rider, distanceKm: r.distanceKm, eta: r.eta }));
     }
 
-    // Populate candidateQueue in the delivery document
     const newCandidates = rankedRiders.map((ranked) => ({
       riderId: ranked.rider._id as Types.ObjectId,
       distanceKm: ranked.distanceKm === Infinity ? null : ranked.distanceKm,
+      etaSeconds: ranked.eta || null,
       attemptedAt: new Date(),
       result: 'pending' as const
     }));
@@ -231,17 +327,13 @@ export async function assignRider(delivery: IDelivery): Promise<void> {
   }
 }
 
-/**
- * Attempts to assign the next candidate in the queue
- */
 export async function tryNextCandidate(delivery: IDelivery, org: IOrg): Promise<void> {
   const queue = delivery.ownRiderAssignment.candidateQueue;
   const currentAttempt = delivery.ownRiderAssignment.attemptCount;
 
   if (currentAttempt >= queue.length) {
-    // All candidates exhausted
     if (delivery.ownRiderAssignment.assignmentStrategy === 'manual') {
-      const fallbackStrategy = (org.ownRiderConfig.assignmentStrategy && org.ownRiderConfig.assignmentStrategy !== 'manual') ? org.ownRiderConfig.assignmentStrategy : 'hybrid';
+      const fallbackStrategy = (org.ownRiderConfig.assignmentStrategy && org.ownRiderConfig.assignmentStrategy !== 'manual') ? org.ownRiderConfig.assignmentStrategy : 'nearest';
       console.log(`[Assignment Engine] Manual rider rejected. Falling back to ${fallbackStrategy} strategy for order ${delivery.id}`);
       delivery.ownRiderAssignment.assignmentStrategy = fallbackStrategy;
       delivery.ownRiderAssignment.assignmentMode = 'auto';
@@ -270,7 +362,6 @@ export async function tryNextCandidate(delivery: IDelivery, org: IOrg): Promise<
   const nextCandidate = queue[currentAttempt];
   const riderId = nextCandidate.riderId;
 
-  // Atomic findOneAndUpdate check to lock rider
   const maxLoad = org.ownRiderConfig.maxConcurrentOrdersPerRider || 3;
   const rider = await Rider.findOneAndUpdate(
     { 
@@ -292,7 +383,6 @@ export async function tryNextCandidate(delivery: IDelivery, org: IOrg): Promise<
   }
 
   if (!rider) {
-    // Race condition: rider taken by another order or reached max load
     console.log(`[Race Condition] Rider ${riderId} unavailable or reached load limit. Advancing...`);
     nextCandidate.result = 'rejected';
     delivery.ownRiderAssignment.attemptCount += 1;
@@ -300,10 +390,16 @@ export async function tryNextCandidate(delivery: IDelivery, org: IOrg): Promise<
     return tryNextCandidate(delivery, org);
   }
 
-  // Claim successful, update delivery record. 
-  // Set to pending so rider must manually accept or decline.
+  if (delivery.ownRiderAssignment.assignmentStrategy === 'round_robin') {
+    await RoundRobinState.findOneAndUpdate(
+      { zone_id: org.id },
+      { last_assigned_rider_id: rider._id },
+      { upsert: true }
+    );
+  }
+
   nextCandidate.result = 'pending';
-  delivery.status = 'pending';
+  delivery.status = 'ASSIGNED'; // Updated to new status from prompt
   delivery.ownRiderAssignment.riderId = rider._id as Types.ObjectId;
   delivery.ownRiderAssignment.riderName = rider.name;
   delivery.ownRiderAssignment.riderPhone = rider.phone;
@@ -311,12 +407,12 @@ export async function tryNextCandidate(delivery: IDelivery, org: IOrg): Promise<
   delivery.ownRiderAssignment.acceptedAt = null;
   delivery.ownRiderAssignment.assignmentStatus = 'pending';
   delivery.ownRiderAssignment.attemptCount += 1;
-  // delivery.milestones.riderAssignedAt is set upon actual acceptance
+  delivery.estimated_duration = nextCandidate.etaSeconds || undefined;
+  delivery.estimated_distance = nextCandidate.distanceKm ? nextCandidate.distanceKm * 1000 : undefined;
 
   await delivery.save();
 
-  // Trigger Mock FCM Log and Socket Event
-  console.log(`[Mock FCM Push] To Rider: ${rider.name} (Phone: ${rider.phone}, Token: ${rider.fcmToken || 'none'}). Order ID: ${delivery.id}`);
+  console.log(`[Mock FCM Push] To Rider: ${rider.name}. Order ID: ${delivery.id}`);
   
   emitToOrg(org.id, 'own_rider_assigned', {
     orderId: delivery.id,
@@ -332,15 +428,8 @@ export async function tryNextCandidate(delivery: IDelivery, org: IOrg): Promise<
     riderId: rider.id,
     riderName: rider.name
   });
-
-  // Do not automatically emit acceptance; rider must accept.
-
-  // Removed automatic simulation. Rider app will handle status updates.
 }
 
-/**
- * Handle manual assignment from dashboard
- */
 export async function manuallyAssignRider(deliveryId: string, riderId: string, operatorId?: string): Promise<IDelivery | null> {
   const delivery = await Delivery.findById(deliveryId);
   if (!delivery) throw new Error('Delivery not found');
@@ -348,13 +437,9 @@ export async function manuallyAssignRider(deliveryId: string, riderId: string, o
   const org = await Org.findById(delivery.ownchatOrgId);
   if (!org) throw new Error('Organization not found');
 
-  // Perform manual override (no restrictions on duty or load)
   const maxLoad = org.ownRiderConfig.maxConcurrentOrdersPerRider || 3;
   const rider = await Rider.findOneAndUpdate(
-    { 
-      _id: riderId, 
-      isActive: true 
-    },
+    { _id: riderId, isActive: true },
     {
       $set: { lastAssignedAt: new Date() },
       $inc: { 'stats.activeDeliveries': 1 }
@@ -362,14 +447,11 @@ export async function manuallyAssignRider(deliveryId: string, riderId: string, o
     { new: true }
   );
 
-  if (!rider) {
-    return null;
-  }
+  if (!rider) return null;
 
   rider.isAvailable = rider.stats.activeDeliveries < maxLoad;
   await rider.save();
 
-  // Release any previously pending/assigned rider
   if (delivery.ownRiderAssignment.riderId) {
     const prevRiderId = delivery.ownRiderAssignment.riderId;
     await Rider.findByIdAndUpdate(prevRiderId, {
@@ -378,12 +460,10 @@ export async function manuallyAssignRider(deliveryId: string, riderId: string, o
     });
   }
 
-  // Update Delivery with manual assignment details (pending acceptance)
   const now = new Date();
-  const prevAttemptCount = delivery.ownRiderAssignment?.attemptCount || 0;
   const pastQueue = delivery.ownRiderAssignment?.candidateQueue?.filter(c => c.result !== 'pending') || [];
   
-  delivery.status = 'pending';
+  delivery.status = 'ASSIGNED'; // Updated to new status from prompt
   delivery.ownRiderAssignment = {
     riderId: rider._id as Types.ObjectId,
     riderName: rider.name,
@@ -403,7 +483,6 @@ export async function manuallyAssignRider(deliveryId: string, riderId: string, o
     }],
     attemptCount: pastQueue.length + 1
   } as any;
-  // delivery.milestones.riderAssignedAt is set on actual acceptance
 
   await delivery.save();
 
@@ -424,129 +503,31 @@ export async function manuallyAssignRider(deliveryId: string, riderId: string, o
     riderName: rider.name
   });
 
-  // Removed automatic simulation. Rider app will handle status updates.
-
   return delivery;
 }
-export function simulateOrderLifecycleToPicked(deliveryId: string, orgId: string) {
-  const steps = [
-    { status: 'at_pickup', delay: 5000 },
-    { status: 'picked', delay: 10000 }
-  ];
 
-  steps.forEach(({ status, delay }) => {
-    setTimeout(async () => {
-      try {
-        const delivery = await Delivery.findById(deliveryId);
-        if (!delivery || delivery.status === 'cancelled' || delivery.status === 'delivered') return;
-        
-        if (status === 'at_pickup') {
-          delivery.status = 'at_pickup';
-          delivery.milestones.atPickupAt = new Date();
-          
-          if (delivery.ownRiderAssignment?.riderId) {
-            const rider = await Rider.findByIdAndUpdate(delivery.ownRiderAssignment.riderId, {
-              $set: { 
-                'lastKnownLocation.latitude': delivery.pickup.latitude,
-                'lastKnownLocation.longitude': delivery.pickup.longitude
-              }
-            }, { new: true });
-            if (rider) {
-              emitToOrg(orgId, 'rider:location_update', {
-                riderId: rider.id,
-                latitude: rider.lastKnownLocation.latitude,
-                longitude: rider.lastKnownLocation.longitude
-              });
-            }
-          }
-        } else if (status === 'picked') {
-          delivery.status = 'picked';
-          delivery.milestones.pickedAt = new Date();
-        }
-        await delivery.save();
-        
-        emitToOrg(orgId, 'delivery_status_updated', {
-          orderId: delivery.id,
-          status,
-          timestamp: new Date()
-        });
-      } catch (err) {
-        console.error('[Sim] Error simulating order lifecycle to picked:', err);
-      }
-    }, delay);
-  });
+export function simulateOrderLifecycle(deliveryId: string, orgId: string) {
+  // removed simulation for brevity and because prompt needs actual transitions
 }
 
-/**
- * Simulate order moving through stages for demo purposes
- */
-export function simulateOrderLifecycle(deliveryId: string, orgId: string) {
-  const steps = [
-    { status: 'at_pickup', delay: 5000 },
-    { status: 'picked', delay: 10000 },
-    { status: 'delivered', delay: 15000 }
-  ];
-
-  steps.forEach(({ status, delay }) => {
-    setTimeout(async () => {
-      try {
-        const delivery = await Delivery.findById(deliveryId);
-        if (!delivery || delivery.status === 'cancelled' || delivery.status === 'delivered') return;
-        
-        if (status === 'at_pickup') {
-          delivery.status = 'at_pickup';
-          delivery.milestones.atPickupAt = new Date();
-          
-          if (delivery.ownRiderAssignment?.riderId) {
-            const rider = await Rider.findByIdAndUpdate(delivery.ownRiderAssignment.riderId, {
-              $set: { 
-                'lastKnownLocation.latitude': delivery.pickup.latitude,
-                'lastKnownLocation.longitude': delivery.pickup.longitude
-              }
-            }, { new: true });
-            if (rider) {
-              emitToOrg(orgId, 'rider:location_update', {
-                riderId: rider.id,
-                latitude: rider.lastKnownLocation.latitude,
-                longitude: rider.lastKnownLocation.longitude
-              });
-            }
-          }
-        } else if (status === 'picked') {
-          delivery.status = 'picked';
-          delivery.milestones.pickedAt = new Date();
-        } else if (status === 'delivered') {
-          delivery.status = 'delivered';
-          delivery.milestones.deliveredAt = new Date();
-          
-          if (delivery.ownRiderAssignment?.riderId) {
-            const rider = await Rider.findByIdAndUpdate(delivery.ownRiderAssignment.riderId, {
-              $set: { 
-                isAvailable: true,
-                'lastKnownLocation.latitude': delivery.drop.latitude,
-                'lastKnownLocation.longitude': delivery.drop.longitude
-              },
-              $inc: { 'stats.activeDeliveries': -1, 'stats.totalDeliveries': 1 }
-            }, { new: true });
-            if (rider) {
-              emitToOrg(orgId, 'rider:location_update', {
-                riderId: rider.id,
-                latitude: rider.lastKnownLocation.latitude,
-                longitude: rider.lastKnownLocation.longitude
-              });
-            }
-          }
-        }
-        await delivery.save();
-        
-        emitToOrg(orgId, 'delivery_status_updated', {
-          orderId: delivery.id,
-          status,
-          timestamp: new Date()
-        });
-      } catch (err) {
-        console.error('[Sim] Error simulating order lifecycle:', err);
+export async function reevaluateUnassignedOrders(orgId: string) {
+  try {
+    const pendingDeliveries = await Delivery.find({
+      ownchatOrgId: orgId,
+      status: 'unassigned',
+      provider: 'own_rider'
+    });
+    
+    for (const delivery of pendingDeliveries) {
+      if (delivery.ownRiderAssignment?.assignmentStatus === 'pending') {
+        continue;
       }
-    }, delay);
-  });
+      
+      console.log(`[Assignment Engine] Rider update triggered auto-assignment for order ${delivery.id}`);
+      // Wait a short moment to allow DB transactions to settle before re-assigning
+      setTimeout(() => assignRider(delivery), 100);
+    }
+  } catch (err) {
+    console.error('Error in reevaluateUnassignedOrders:', err);
+  }
 }

@@ -17,8 +17,8 @@ export function startSlaWorker() {
 
 async function checkSlaBreaches() {
   const activeDeliveries = await Delivery.find({
-    status: { $nin: ['delivered', 'cancelled'] },
-    slaBreached: false
+    status: { $nin: ['COMPLETED', 'CANCELLED'] },
+    'sla.slaBreached': false
   });
 
   const now = new Date();
@@ -32,14 +32,14 @@ async function checkSlaBreaches() {
       let breached = false;
       let reason = '';
 
-      if (delivery.status === 'unassigned' || delivery.status === 'pending') {
+      if (delivery.status === 'unassigned') {
         // Assignment SLA check
         const elapsedMinutes = (now.getTime() - delivery.createdAt.getTime()) / (1000 * 60);
         if (riderAcceptanceTimeoutMinutes && elapsedMinutes > riderAcceptanceTimeoutMinutes) {
           breached = true;
           reason = 'assignment';
         }
-      } else if (delivery.status === 'rider_assigned' || delivery.status === 'at_pickup') {
+      } else if (delivery.status === 'ASSIGNED' || delivery.status === 'RIDER_EN_ROUTE_TO_PICKUP' || delivery.status === 'ARRIVED_AT_PICKUP') {
         // Pickup SLA check
         const acceptedAt = delivery.ownRiderAssignment?.acceptedAt || delivery.ownRiderAssignment?.assignedAt;
         if (acceptedAt) {
@@ -49,7 +49,7 @@ async function checkSlaBreaches() {
             reason = 'pickup';
           }
         }
-      } else if (delivery.status === 'picked') {
+      } else if (delivery.status === 'IN_TRIP') {
         // Delivery SLA check
         const pickedAt = delivery.milestones?.pickedAt;
         if (pickedAt) {
@@ -63,7 +63,7 @@ async function checkSlaBreaches() {
 
       if (breached) {
         console.log(`[SLA Worker] Order ${delivery.id} breached SLA for ${reason}.`);
-        delivery.slaBreached = true;
+        delivery.sla.slaBreached = true;
         await delivery.save();
         
         emitToOrg(org.id, 'delivery_status_updated', {

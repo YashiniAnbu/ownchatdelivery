@@ -11,6 +11,7 @@ import SettingsPage from './pages/SettingsPage';
 import RidersPage from './pages/RidersPage';
 import AuditLogsPage from './pages/AuditLogsPage';
 import RiderSimulatorPage from './pages/RiderSimulatorPage';
+import CustomerTrackingPage from './pages/CustomerTrackingPage';
 import api from './utils/api';
 import type { IOrg } from './types';
 import { RefreshCw } from 'lucide-react';
@@ -131,6 +132,7 @@ export default function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<LoginPage />} />
+          <Route path="/track/:orderId" element={<CustomerTrackingPage />} />
           <Route path="/*" element={<ProtectedRoutes />} />
         </Routes>
       </BrowserRouter>

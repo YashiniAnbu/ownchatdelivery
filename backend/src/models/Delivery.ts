@@ -4,6 +4,7 @@ import { IDelivery } from '../types';
 const candidateSchema = new Schema({
   riderId: { type: Schema.Types.ObjectId, ref: 'Rider', required: true },
   distanceKm: { type: Number, default: null },
+  etaSeconds: { type: Number, default: null },
   attemptedAt: { type: Date, required: true },
   result: {
     type: String,
@@ -21,7 +22,7 @@ const deliverySchema = new Schema<IDelivery>({
   },
   status: {
     type: String,
-    enum: ['unassigned', 'pending', 'rider_assigned', 'at_pickup', 'picked', 'delivered', 'cancelled'],
+    enum: ['unassigned', 'ASSIGNED', 'RIDER_EN_ROUTE_TO_PICKUP', 'ARRIVED_AT_PICKUP', 'IN_TRIP', 'COMPLETED', 'CANCELLED'],
     default: 'unassigned'
   },
   customer: {
@@ -31,12 +32,14 @@ const deliverySchema = new Schema<IDelivery>({
   pickup: {
     label: { type: String, required: true },
     latitude: { type: Number, required: true },
-    longitude: { type: Number, required: true }
+    longitude: { type: Number, required: true },
+    formatted_address: { type: String }
   },
   drop: {
     label: { type: String, required: true },
     latitude: { type: Number, required: true },
-    longitude: { type: Number, required: true }
+    longitude: { type: Number, required: true },
+    formatted_address: { type: String }
   },
   ownRiderAssignment: {
     riderId: { type: Schema.Types.ObjectId, ref: 'Rider', default: null },
@@ -79,7 +82,9 @@ const deliverySchema = new Schema<IDelivery>({
     },
     breachedAt: { type: Date, default: null }
   },
-  cost: { type: Number, default: 0 }
+  cost: { type: Number, default: 0 },
+  estimated_duration: { type: Number, default: null },
+  estimated_distance: { type: Number, default: null }
 }, {
   timestamps: true
 });

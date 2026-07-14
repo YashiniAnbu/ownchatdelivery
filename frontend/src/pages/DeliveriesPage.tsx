@@ -95,11 +95,12 @@ export default function DeliveriesPage({ activeOrgId }: DeliveriesPageProps) {
 
   const statusOptions = [
     { value: 'unassigned', label: 'Order Created' },
-    { value: 'pending', label: 'Rider Assigned' },
-    { value: 'at_pickup', label: 'Reached Store' },
-    { value: 'picked', label: 'Parcel In-Transit' },
-    { value: 'delivered', label: 'Delivered' },
-    { value: 'cancelled', label: 'Cancelled' }
+    { value: 'ASSIGNED', label: 'Rider Assigned' },
+    { value: 'RIDER_EN_ROUTE_TO_PICKUP', label: 'En Route to Store' },
+    { value: 'ARRIVED_AT_PICKUP', label: 'Reached Store' },
+    { value: 'IN_TRIP', label: 'Parcel In-Transit' },
+    { value: 'COMPLETED', label: 'Delivered' },
+    { value: 'CANCELLED', label: 'Cancelled' }
   ];
 
   return (
@@ -153,11 +154,12 @@ export default function DeliveriesPage({ activeOrgId }: DeliveriesPageProps) {
           <SelectContent>
             <SelectItem value="all">All Statuses</SelectItem>
             <SelectItem value="unassigned">Order Created</SelectItem>
-            <SelectItem value="pending">Rider Assigned</SelectItem>
-            <SelectItem value="at_pickup">Reached Store</SelectItem>
-            <SelectItem value="picked">Parcel In-Transit</SelectItem>
-            <SelectItem value="delivered">Delivered</SelectItem>
-            <SelectItem value="cancelled">Cancelled</SelectItem>
+            <SelectItem value="ASSIGNED">Rider Assigned</SelectItem>
+            <SelectItem value="RIDER_EN_ROUTE_TO_PICKUP">En Route to Store</SelectItem>
+            <SelectItem value="ARRIVED_AT_PICKUP">Reached Store</SelectItem>
+            <SelectItem value="IN_TRIP">Parcel In-Transit</SelectItem>
+            <SelectItem value="COMPLETED">Delivered</SelectItem>
+            <SelectItem value="CANCELLED">Cancelled</SelectItem>
           </SelectContent>
         </Select>
 

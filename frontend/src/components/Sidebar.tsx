@@ -37,12 +37,22 @@ export default function Sidebar() {
       items: [
         { name: 'Dashboard', path: '/dashboard', icon: LayoutDashboard },
         { name: 'Deliveries', path: '/deliveries', icon: Truck },
-        { name: 'Settings', path: '/settings', icon: Settings },
         { name: 'Riders', path: '/riders', icon: Bike },
         { name: 'Audit Logs', path: '/audit-logs', icon: FileText }
       ]
     }
   ];
+
+  const adminGroup = {
+    title: 'ADMINISTRATION',
+    items: [
+      { name: 'Store Config', path: '/settings', icon: Settings },
+    ]
+  };
+
+  if (user?.role === 'owner') {
+    menuGroups.push(adminGroup);
+  }
 
   const handleLogout = async () => {
     await logout();

@@ -21,6 +21,13 @@ export default function SettingsPage({ activeOrgId }: SettingsPageProps) {
   const [assignmentMins, setAssignmentMins] = useState('2');
   const [pickupMins, setPickupMins] = useState('20');
   const [deliveryMins, setDeliveryMins] = useState('45');
+  const [assignmentStrategy, setAssignmentStrategy] = useState('hybrid');
+  const [allowStaffManualAssignment, setAllowStaffManualAssignment] = useState(true);
+
+  // Check if current user is admin
+  const currentUserStr = localStorage.getItem('user');
+  const currentUser = currentUserStr ? JSON.parse(currentUserStr) : null;
+  const isAdmin = currentUser?.role === 'owner';
 
   const fetchOrgSettings = async () => {
     if (!activeOrgId) return;
@@ -31,6 +38,8 @@ export default function SettingsPage({ activeOrgId }: SettingsPageProps) {
       setAssignmentMins(data.ownRiderConfig?.riderAcceptanceTimeoutMinutes?.toString() || '2');
       setPickupMins(data.ownRiderConfig?.pickupTimeoutMinutes?.toString() || '20');
       setDeliveryMins(data.ownRiderConfig?.deliveryTimeoutMinutes?.toString() || '45');
+      setAssignmentStrategy(data.ownRiderConfig?.assignmentStrategy || 'hybrid');
+      setAllowStaffManualAssignment(data.ownRiderConfig?.allowStaffManualAssignment ?? true);
     } catch (err) {
       console.error(err);
     } finally {
@@ -52,8 +61,10 @@ export default function SettingsPage({ activeOrgId }: SettingsPageProps) {
         assignmentMins: parseInt(assignmentMins, 10),
         pickupMins: parseInt(pickupMins, 10),
         deliveryMins: parseInt(deliveryMins, 10),
-        operatorId: localStorage.getItem('user') ? JSON.parse(localStorage.getItem('user')!).id : 'system',
-        operatorName: localStorage.getItem('user') ? JSON.parse(localStorage.getItem('user')!).name : 'Owner'
+        assignmentStrategy,
+        allowStaffManualAssignment,
+        operatorId: currentUser?.id || 'system',
+        operatorName: currentUser?.name || 'Owner'
       });
       fetchOrgSettings();
       alert('SLA settings saved successfully!');
@@ -198,6 +209,41 @@ export default function SettingsPage({ activeOrgId }: SettingsPageProps) {
                   </span>
                 </div>
               </div>
+
+              {isAdmin && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4 border-t mt-4">
+                  <div className="space-y-2">
+                    <Label className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Auto-Assignment Engine</Label>
+                    <select
+                      value={assignmentStrategy}
+                      onChange={(e) => setAssignmentStrategy(e.target.value)}
+                      className="w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring h-9"
+                    >
+                      <option value="hybrid">Enabled (Hybrid Routing)</option>
+                      <option value="nearest">Enabled (Nearest First)</option>
+                      <option value="round_robin">Enabled (Round Robin)</option>
+                      <option value="manual">Disabled (Manual Only)</option>
+                    </select>
+                    <span className="text-[9px] text-muted-foreground block leading-normal">
+                      Controls if the background engine assigns riders automatically.
+                    </span>
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest">Staff Manual Overrides</Label>
+                    <select
+                      value={allowStaffManualAssignment ? 'true' : 'false'}
+                      onChange={(e) => setAllowStaffManualAssignment(e.target.value === 'true')}
+                      className="w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring h-9"
+                    >
+                      <option value="true">Allowed (Staff can assign)</option>
+                      <option value="false">Blocked (Only Admins can assign)</option>
+                    </select>
+                    <span className="text-[9px] text-muted-foreground block leading-normal">
+                      Allow non-admin dispatchers to manually assign riders.
+                    </span>
+                  </div>
+                </div>
+              )}
 
               <div className="flex justify-end pt-4 border-t mt-4">
                 <Button type="submit" disabled={submitting} className="gap-1.5 h-10">

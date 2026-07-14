@@ -124,7 +124,7 @@ router.get('/:orgId/dashboard-stats', async (req: Request, res: Response) => {
         validRadiusCount++;
       }
 
-      if (d.status === 'delivered' && d.milestones?.riderAssignedAt && d.milestones?.deliveredAt) {
+      if (d.status === 'COMPLETED' && d.milestones?.riderAssignedAt && d.milestones?.deliveredAt) {
         const duration = new Date(d.milestones.deliveredAt).getTime() - new Date(d.milestones.riderAssignedAt).getTime();
         totalDeliveryTimeMs += duration;
         validDeliveryTimeCount++;
@@ -297,7 +297,7 @@ router.patch('/:orgId/wallet', async (req: Request, res: Response) => {
 router.patch('/:orgId/sla', async (req: Request, res: Response) => {
   try {
     const { orgId } = req.params;
-    const { assignmentMins, pickupMins, deliveryMins } = req.body;
+    const { assignmentMins, pickupMins, deliveryMins, assignmentStrategy, allowStaffManualAssignment } = req.body;
 
     const org = await Org.findById(orgId);
     if (!org) {
@@ -309,6 +309,8 @@ router.patch('/:orgId/sla', async (req: Request, res: Response) => {
     if (assignmentMins !== undefined) org.ownRiderConfig.riderAcceptanceTimeoutMinutes = Number(assignmentMins);
     if (pickupMins !== undefined) org.ownRiderConfig.pickupTimeoutMinutes = Number(pickupMins);
     if (deliveryMins !== undefined) org.ownRiderConfig.deliveryTimeoutMinutes = Number(deliveryMins);
+    if (assignmentStrategy !== undefined) org.ownRiderConfig.assignmentStrategy = assignmentStrategy;
+    if (allowStaffManualAssignment !== undefined) org.ownRiderConfig.allowStaffManualAssignment = allowStaffManualAssignment;
 
     await org.save();
 

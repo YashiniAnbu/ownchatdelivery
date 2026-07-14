@@ -1,6 +1,6 @@
 export type AssignmentStrategy = 'manual' | 'nearest' | 'round_robin' | 'load_balanced' | 'hybrid';
 export type VehicleType = 'bike' | 'scooter' | 'e-bike';
-export type DeliveryStatus = 'unassigned' | 'pending' | 'rider_assigned' | 'at_pickup' | 'picked' | 'delivered' | 'cancelled';
+export type DeliveryStatus = 'unassigned' | 'ASSIGNED' | 'RIDER_EN_ROUTE_TO_PICKUP' | 'ARRIVED_AT_PICKUP' | 'IN_TRIP' | 'COMPLETED' | 'CANCELLED';
 export type AssignmentStatus = 'unassigned' | 'pending' | 'accepted' | 'rejected' | 'timeout';
 export type Provider = 'own_rider' | 'porter' | 'qwqer' | 'adloggs';
 

@@ -25,7 +25,7 @@ const router = Router();
 router.post('/create', upload.single('profilePhoto'), async (req: Request, res: Response) => {
   try {
     const { name, phone, ownchatOrgId, vehicleType, vehicleNumber, email, pin, licenseNo, address } = req.body;
-    
+
     let profilePhoto = req.body.profilePhoto;
     if (req.file) {
       profilePhoto = `http://localhost:${process.env.PORT || 3000}/uploads/${req.file.filename}`;
@@ -141,13 +141,13 @@ router.post('/assign', async (req: Request, res: Response) => {
       // Rider is no longer available. Trigger auto assignment for other eligible riders!
       const del = await Delivery.findById(deliveryId);
       if (!del) return res.status(404).json({ error: 'Delivery not found' });
-      
+
       await assignRider(del);
       const updatedDel = await Delivery.findById(deliveryId);
-      
-      return res.json({ 
-        message: 'Selected rider became unavailable. Auto-assigned to another eligible rider.', 
-        delivery: updatedDel 
+
+      return res.json({
+        message: 'Selected rider became unavailable. Auto-assigned to another eligible rider.',
+        delivery: updatedDel
       });
     }
 
@@ -317,7 +317,7 @@ router.post('/app/duty', async (req: Request, res: Response) => {
       },
       ip: req.ip
     });
-    
+
     emitToDispatchers(rider.ownchatOrgId, 'rider:status_changed', {
       riderId: rider._id,
       isOnDuty: rider.isOnDuty,
@@ -363,7 +363,7 @@ router.post('/app/break', async (req: Request, res: Response) => {
       },
       ip: req.ip
     });
-    
+
     emitToDispatchers(rider.ownchatOrgId, 'rider:status_changed', {
       riderId: rider._id,
       isOnDuty: rider.isOnDuty,
@@ -395,7 +395,7 @@ router.post('/app/location', async (req: Request, res: Response) => {
     if (!rider) {
       return res.status(404).json({ error: 'Rider not found' });
     }
-    
+
     emitToDispatchers(rider.ownchatOrgId, 'rider:location_update', {
       riderId: rider._id,
       latitude: rider.lastKnownLocation?.latitude,
@@ -433,18 +433,25 @@ router.post('/app/status', async (req: Request, res: Response) => {
 
     if (status === 'accepted') {
       // Transition from pending to accepted
-      delivery.status = 'rider_assigned';
+      delivery.status = 'RIDER_EN_ROUTE_TO_PICKUP';
+      if (!delivery.ownRiderAssignment) {
+        delivery.ownRiderAssignment = {} as any;
+      }
       delivery.ownRiderAssignment.assignmentStatus = 'accepted';
       delivery.ownRiderAssignment.acceptedAt = new Date();
+      
+      if (!delivery.milestones) delivery.milestones = {} as any;
       delivery.milestones.riderAssignedAt = new Date();
 
       // Update candidate queue entry
-      const cand = delivery.ownRiderAssignment.candidateQueue.find(
-        (c) => c.riderId.toString() === riderId.toString()
-      );
-      if (cand) {
-        cand.result = 'accepted';
-        delivery.markModified('ownRiderAssignment.candidateQueue');
+      if (delivery.ownRiderAssignment.candidateQueue && Array.isArray(delivery.ownRiderAssignment.candidateQueue)) {
+        const cand = delivery.ownRiderAssignment.candidateQueue.find(
+          (c: any) => c && c.riderId && c.riderId.toString() === riderId.toString()
+        );
+        if (cand) {
+          cand.result = 'accepted';
+          delivery.markModified('ownRiderAssignment.candidateQueue');
+        }
       }
 
       await delivery.save();
@@ -465,7 +472,7 @@ router.post('/app/status', async (req: Request, res: Response) => {
         riderId: rider.id,
         riderName: rider.name
       });
-      
+
       // Simulation removed, stages manually controlled by rider
     } else if (status === 'rejected') {
       // Release rider
@@ -475,14 +482,19 @@ router.post('/app/status', async (req: Request, res: Response) => {
       });
 
       // Update candidate queue entry
-      const cand = delivery.ownRiderAssignment.candidateQueue.find(
-        (c) => c.riderId.toString() === riderId.toString()
-      );
-      if (cand) {
-        cand.result = 'rejected';
-        delivery.markModified('ownRiderAssignment.candidateQueue');
+      if (delivery.ownRiderAssignment && delivery.ownRiderAssignment.candidateQueue && Array.isArray(delivery.ownRiderAssignment.candidateQueue)) {
+        const cand = delivery.ownRiderAssignment.candidateQueue.find(
+          (c: any) => c && c.riderId && c.riderId.toString() === riderId.toString()
+        );
+        if (cand) {
+          cand.result = 'rejected';
+          delivery.markModified('ownRiderAssignment.candidateQueue');
+        }
       }
-      
+
+      if (!delivery.ownRiderAssignment) {
+        delivery.ownRiderAssignment = {} as any;
+      }
       delivery.ownRiderAssignment.assignmentStatus = 'rejected';
       delivery.ownRiderAssignment.rejectedAt = new Date();
       await delivery.save();
@@ -510,7 +522,7 @@ router.post('/app/status', async (req: Request, res: Response) => {
         tryNextCandidate(delivery, org);
       }, 100);
     } else if (status === 'at_pickup') {
-      delivery.status = 'at_pickup';
+      delivery.status = 'ARRIVED_AT_PICKUP';
       delivery.milestones.atPickupAt = new Date();
       await delivery.save();
 
@@ -521,17 +533,17 @@ router.post('/app/status', async (req: Request, res: Response) => {
         action: 'STATUS_UPDATE',
         targetType: 'order',
         targetId: deliveryId,
-        metadata: { status: 'at_pickup' },
+        metadata: { status: 'ARRIVED_AT_PICKUP' },
         ip: req.ip
       });
 
       emitToOrg(org.id, 'delivery_status_updated', {
         orderId: delivery.id,
-        status: 'at_pickup',
+        status: 'ARRIVED_AT_PICKUP',
         timestamp: new Date()
       });
     } else if (status === 'picked') {
-      delivery.status = 'picked';
+      delivery.status = 'IN_TRIP';
       delivery.milestones.pickedAt = new Date();
       await delivery.save();
 
@@ -542,17 +554,17 @@ router.post('/app/status', async (req: Request, res: Response) => {
         action: 'STATUS_UPDATE',
         targetType: 'order',
         targetId: deliveryId,
-        metadata: { status: 'picked' },
+        metadata: { status: 'IN_TRIP' },
         ip: req.ip
       });
 
       emitToOrg(org.id, 'delivery_status_updated', {
         orderId: delivery.id,
-        status: 'picked',
+        status: 'IN_TRIP',
         timestamp: new Date()
       });
     } else if (status === 'delivered') {
-      delivery.status = 'delivered';
+      delivery.status = 'COMPLETED';
       delivery.milestones.deliveredAt = new Date();
       await delivery.save();
 
@@ -569,13 +581,13 @@ router.post('/app/status', async (req: Request, res: Response) => {
         action: 'STATUS_UPDATE',
         targetType: 'order',
         targetId: deliveryId,
-        metadata: { status: 'delivered' },
+        metadata: { status: 'COMPLETED' },
         ip: req.ip
       });
 
       emitToOrg(org.id, 'delivery_status_updated', {
         orderId: delivery.id,
-        status: 'delivered',
+        status: 'COMPLETED',
         timestamp: new Date()
       });
     } else {
@@ -605,12 +617,12 @@ router.get('/:riderId', async (req: Request, res: Response) => {
 router.put('/:riderId', upload.single('profilePhoto'), async (req: Request, res: Response) => {
   try {
     const { name, phone, vehicleType, vehicleNumber, email, licenseNo, address } = req.body;
-    
+
     let profilePhoto = req.body.profilePhoto;
     if (req.file) {
       profilePhoto = `http://localhost:${process.env.PORT || 3000}/uploads/${req.file.filename}`;
     }
-    
+
     if (phone && phone.length !== 10) {
       return res.status(400).json({ error: 'Phone number must be exactly 10 digits' });
     }

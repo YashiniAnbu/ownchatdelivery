@@ -30,15 +30,32 @@ interface AssignRiderModalProps {
   onClose: () => void;
   delivery: IDelivery;
   riders: any[]; // fallback
+  orgStrategy?: string;
   onConfirm: (riderId: string) => void;
 }
 
-export default function AssignRiderModal({ isOpen, onClose, delivery, onConfirm }: AssignRiderModalProps) {
+export default function AssignRiderModal({ isOpen, onClose, delivery, orgStrategy, onConfirm }: AssignRiderModalProps) {
   const [scoredRiders, setScoredRiders] = useState<ScoredRider[]>([]);
   const [excludedRiders, setExcludedRiders] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [preference, setPreference] = useState<'hybrid' | 'nearest' | 'load' | 'fairness'>('hybrid');
+  
+  // Map DB strategy to UI preference
+  const mapStrategyToPreference = (strat?: string) => {
+    if (strat === 'nearest') return 'nearest';
+    if (strat === 'load_balanced') return 'load';
+    if (strat === 'round_robin') return 'fairness';
+    return 'hybrid'; // Default fallback
+  };
+
+  const [preference, setPreference] = useState<'hybrid' | 'nearest' | 'load' | 'fairness'>(mapStrategyToPreference(orgStrategy));
+
+  // If orgStrategy prop updates (e.g. they changed it in settings), sync it
+  useEffect(() => {
+    if (isOpen) {
+      setPreference(mapStrategyToPreference(orgStrategy));
+    }
+  }, [orgStrategy, isOpen]);
 
   const fetchScoredRiders = async () => {
     setLoading(true);
@@ -63,7 +80,7 @@ export default function AssignRiderModal({ isOpen, onClose, delivery, onConfirm 
       // Connect to Socket.io for real-time updates
       socket = io('http://localhost:5001');
       socket.on('connect', () => {
-        socket?.emit('join_dispatchers', delivery.ownchatOrgId);
+        socket?.emit('join_dispatchers', delivery.ownchatOrgId?.toString?.() ?? delivery.ownchatOrgId);
       });
 
       const handleLiveUpdate = () => {
@@ -78,7 +95,7 @@ export default function AssignRiderModal({ isOpen, onClose, delivery, onConfirm 
       socket.on('rider:status_changed', handleLiveUpdate);
       socket.on('order:assigned', handleLiveUpdate);
     }
-    
+
     return () => {
       if (socket) socket.disconnect();
     };
@@ -139,9 +156,9 @@ export default function AssignRiderModal({ isOpen, onClose, delivery, onConfirm 
             {excludedRiders.length > 0 && (
               <Alert variant="default" className="bg-amber-50 border-amber-200 text-amber-800 py-2">
                 <Info className="h-4 w-4 text-amber-600" />
-                <AlertTitle className="text-xs font-bold text-amber-800">Partial Results</AlertTitle>
+                <AlertTitle className="text-xs font-bold text-amber-800">Riders Flagged</AlertTitle>
                 <AlertDescription className="text-xs">
-                  {excludedRiders.length} rider(s) omitted — distance lookup failed via Google API.
+                  {excludedRiders.length} rider(s) previously timed-out or rejected this order. They are still shown below for manual override.
                 </AlertDescription>
               </Alert>
             )}
@@ -170,14 +187,15 @@ export default function AssignRiderModal({ isOpen, onClose, delivery, onConfirm 
                       <div>
                         <div className="font-semibold text-sm">{r.name}</div>
                         <div className="text-[10px] text-muted-foreground capitalize">{r.vehicleType}</div>
-                        <div className="flex gap-1 mt-1">
+                        <div className="flex flex-wrap gap-1 mt-1">
                           {nearestRider?._id === r._id && <Badge variant="outline" className="text-[9px] bg-blue-50 text-blue-700">Nearest ETA</Badge>}
                           {leastBusyRider?._id === r._id && <Badge variant="outline" className="text-[9px] bg-emerald-50 text-emerald-700">Least Busy</Badge>}
                           {fairestRider?._id === r._id && <Badge variant="outline" className="text-[9px] bg-purple-50 text-purple-700">Due for Job</Badge>}
+                          {excludedRiders.includes(r._id) && <Badge variant="outline" className="text-[9px] bg-red-50 text-red-700 border-red-200">Flagged</Badge>}
                         </div>
                       </div>
                       <Badge variant={idx === 0 ? 'default' : 'secondary'} className="flex flex-col items-end py-1">
-                        <span>{r.totalScore.toFixed(3)}</span>
+                        <span>{(r.totalScore ?? 0).toFixed(3)}</span>
                         {idx === 0 && <span className="text-[9px] block">Recommended</span>}
                       </Badge>
                     </div>
@@ -192,7 +210,7 @@ export default function AssignRiderModal({ isOpen, onClose, delivery, onConfirm 
                       </div>
                       <div>
                         <div className="font-bold uppercase">Fairness</div>
-                        <div className="font-mono text-foreground">({r.fairnessScore.toFixed(2)})</div>
+                        <div className="font-mono text-foreground">({(r.fairnessScore ?? 0).toFixed(2)})</div>
                       </div>
                     </div>
                     <Button onClick={() => onConfirm(r._id)} className="w-full text-xs">
@@ -226,23 +244,24 @@ export default function AssignRiderModal({ isOpen, onClose, delivery, onConfirm 
                           {nearestRider?._id === r._id && <Badge variant="outline" className="text-[9px] bg-blue-50 text-blue-700">Nearest ETA</Badge>}
                           {leastBusyRider?._id === r._id && <Badge variant="outline" className="text-[9px] bg-emerald-50 text-emerald-700">Least Busy</Badge>}
                           {fairestRider?._id === r._id && <Badge variant="outline" className="text-[9px] bg-purple-50 text-purple-700">Due for Job</Badge>}
+                          {excludedRiders.includes(r._id) && <Badge variant="outline" className="text-[9px] bg-red-50 text-red-700 border-red-200">Flagged</Badge>}
                         </div>
                       </TableCell>
                       <TableCell className="text-right font-mono">
-                        {r.distanceKm !== null ? `${r.distanceKm.toFixed(2)} km` : '—'}
-                        <div className="text-[9px] text-muted-foreground">({r.distanceScore.toFixed(2)})</div>
+                        {r.distanceKm != null ? `${r.distanceKm.toFixed(2)} km` : '—'}
+                        <div className="text-[9px] text-muted-foreground">({(r.distanceScore ?? 0).toFixed(2)})</div>
                       </TableCell>
                       <TableCell className="text-right font-mono">
                         {r.activeDeliveries} active
-                        <div className="text-[9px] text-muted-foreground">({r.loadScore.toFixed(2)})</div>
+                        <div className="text-[9px] text-muted-foreground">({(r.loadScore ?? 0).toFixed(2)})</div>
                       </TableCell>
                       <TableCell className="text-right font-mono">
                         —
-                        <div className="text-[9px] text-muted-foreground">({r.fairnessScore.toFixed(2)})</div>
+                        <div className="text-[9px] text-muted-foreground">({(r.fairnessScore ?? 0).toFixed(2)})</div>
                       </TableCell>
                       <TableCell className="text-right">
                         <Badge variant={idx === 0 ? 'default' : 'secondary'}>
-                          {r.totalScore.toFixed(3)}
+                          {(r.totalScore ?? 0).toFixed(3)}
                         </Badge>
                         {idx === 0 && <span className="text-[9px] text-primary block mt-1 font-semibold">Recommended</span>}
                       </TableCell>

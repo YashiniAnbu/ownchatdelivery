@@ -8,6 +8,43 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { MapContainer, TileLayer, Marker, useMap, Popup } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+import L from 'leaflet';
+
+// Fix Leaflet's default icon path issues in React
+delete (L.Icon.Default.prototype as any)._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+});
+
+const createColoredIcon = (color: string) => {
+  return L.divIcon({
+    className: 'custom-colored-icon',
+    html: `<div style="background-color: ${color}; width: 16px; height: 16px; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 6px rgba(0,0,0,0.5);"></div>`,
+    iconSize: [16, 16],
+    iconAnchor: [8, 8]
+  });
+};
+
+const riderIcons: Record<string, L.DivIcon> = {
+  idle: createColoredIcon('#94a3b8'), // slate-400
+  RIDER_EN_ROUTE_TO_PICKUP: createColoredIcon('#f97316'), // orange-500
+  ARRIVED_AT_PICKUP: createColoredIcon('#3b82f6'), // blue-500
+  IN_TRIP: createColoredIcon('#10b981'), // emerald-500
+};
+
+function MapUpdater({ center }: { center: [number, number] }) {
+  const map = useMap();
+  React.useEffect(() => {
+    map.setView(center, map.getZoom(), { animate: true });
+  }, [center, map]);
+  return null;
+}
+
+// Removed local Haversine in favor of Distance Matrix API
 
 interface RiderSimulatorPageProps {
   activeOrgId: string;
@@ -17,6 +54,7 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
   const [riders, setRiders] = useState<IRider[]>([]);
   const [deliveries, setDeliveries] = useState<IDelivery[]>([]);
   const [loading, setLoading] = useState(true);
+  const socketRef = React.useRef<Socket | null>(null);
 
   // Active toast notification state
   const [incomingOrder, setIncomingOrder] = useState<any | null>(null);
@@ -27,7 +65,10 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
   
   // Custom Rider GPS and duty forms state
   const [gpsForm, setGpsForm] = useState<Record<string, { lat: string; lng: string }>>({});
+  const [etaData, setEtaData] = useState<Record<string, { dist: string; eta: string }>>({});
   const [showHistory, setShowHistory] = useState<Record<string, boolean>>({});
+  const [autoDriveRiderId, setAutoDriveRiderId] = useState<string | null>(null);
+  const tickCountRef = React.useRef(0);
 
   // Request Notification permission on mount
   useEffect(() => {
@@ -46,15 +87,19 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
       setRiders(riderRes.data);
       setDeliveries(deliveryRes.data);
       
-      // Initialize GPS forms
-      const forms: any = {};
-      riderRes.data.forEach((r: IRider) => {
-        forms[r._id] = {
-          lat: r.lastKnownLocation?.latitude?.toString() || '13.0418',
-          lng: r.lastKnownLocation?.longitude?.toString() || '80.2341'
-        };
+      // Initialize GPS forms only if they don't exist
+      setGpsForm(prev => {
+        const forms: any = { ...prev };
+        riderRes.data.forEach((r: IRider) => {
+          if (!forms[r._id]) {
+            forms[r._id] = {
+              lat: r.lastKnownLocation?.latitude?.toString() || '13.0418',
+              lng: r.lastKnownLocation?.longitude?.toString() || '80.2341'
+            };
+          }
+        });
+        return forms;
       });
-      setGpsForm(forms);
     } catch (err) {
       console.error(err);
     } finally {
@@ -62,11 +107,103 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
     }
   };
 
+  const loggedInRiderIdRef = React.useRef(loggedInRiderId);
+  useEffect(() => {
+    loggedInRiderIdRef.current = loggedInRiderId;
+  }, [loggedInRiderId]);
+
+  const deliveriesRef = React.useRef(deliveries);
+  useEffect(() => { deliveriesRef.current = deliveries; }, [deliveries]);
+
+  const gpsFormRef = React.useRef(gpsForm);
+  useEffect(() => { gpsFormRef.current = gpsForm; }, [gpsForm]);
+
+  useEffect(() => {
+    let interval: any;
+    if (autoDriveRiderId) {
+      interval = setInterval(() => {
+        tickCountRef.current += 1;
+        
+        const coords = gpsFormRef.current[autoDriveRiderId];
+        if (!coords) return;
+        
+        const activeDelivery = deliveriesRef.current.find(d => 
+          d.ownRiderAssignment?.riderId?.toString() === autoDriveRiderId.toString() && 
+          ['RIDER_EN_ROUTE_TO_PICKUP', 'IN_TRIP'].includes(d.status)
+        );
+        
+        let targetLat: number | null = null;
+        let targetLng: number | null = null;
+        
+        if (activeDelivery) {
+           if (activeDelivery.status === 'RIDER_EN_ROUTE_TO_PICKUP') {
+             targetLat = activeDelivery.pickup.latitude;
+             targetLng = activeDelivery.pickup.longitude;
+           } else if (activeDelivery.status === 'IN_TRIP') {
+             targetLat = activeDelivery.drop.latitude;
+             targetLng = activeDelivery.drop.longitude;
+           }
+        }
+        
+        let newLatStr = coords.lat;
+        let newLngStr = coords.lng;
+        
+        if (targetLat !== null && targetLng !== null) {
+          const currentLat = parseFloat(coords.lat);
+          const currentLng = parseFloat(coords.lng);
+          
+          // Move ~30 meters per 3 seconds (approx 0.0003 degrees)
+          const STEP_DEG = 0.0003;
+          const distLat = targetLat - currentLat;
+          const distLng = targetLng - currentLng;
+          const dist = Math.sqrt(distLat*distLat + distLng*distLng);
+          
+          if (dist > STEP_DEG) {
+            const ratio = STEP_DEG / dist;
+            newLatStr = (currentLat + distLat * ratio).toFixed(5);
+            newLngStr = (currentLng + distLng * ratio).toFixed(5);
+          } else {
+            newLatStr = targetLat.toFixed(5);
+            newLngStr = targetLng.toFixed(5);
+          }
+        } else {
+           // Fallback default idle movement (Stay still)
+           newLatStr = coords.lat;
+           newLngStr = coords.lng;
+        }
+        
+        // Update local state and ref immediately
+        const nextForm = { ...gpsFormRef.current, [autoDriveRiderId]: { lat: newLatStr, lng: newLngStr } };
+        gpsFormRef.current = nextForm;
+        setGpsForm(nextForm);
+        
+        // Trigger Side Effects
+        handleUpdateLocation(autoDriveRiderId, parseFloat(newLatStr), parseFloat(newLngStr));
+        
+        // Fetch ETA via Distance Matrix API on first tick and every 9 seconds (3 ticks)
+        if (targetLat !== null && targetLng !== null && (tickCountRef.current === 1 || tickCountRef.current % 3 === 0)) {
+           api.get(`/delivery/eta?originLat=${newLatStr}&originLng=${newLngStr}&destLat=${targetLat}&destLng=${targetLng}`)
+                .then(res => {
+                   setEtaData(prev => ({
+                     ...prev,
+                     [autoDriveRiderId]: {
+                       dist: (res.data.distance_meters / 1000).toFixed(2) + ' km',
+                       eta: Math.ceil(res.data.duration_seconds / 60) + ' mins'
+                     }
+                   }));
+                }).catch(err => console.error('[DistanceMatrix]', err));
+        }
+      }, 3000);
+    }
+    return () => clearInterval(interval);
+  }, [autoDriveRiderId]);
+
   useEffect(() => {
     fetchRiders();
 
-    // Setup Socket connection
-    const newSocket = io('http://localhost:5001');
+    // Setup Socket connection (Force websocket to avoid polling drops and make DevTools tracing easier)
+    const newSocket = io('http://localhost:5001', { transports: ['websocket'] });
+    socketRef.current = newSocket;
     newSocket.on('connect', () => {
       console.log('[Simulator WebSockets] Connected:', newSocket.id);
       newSocket.emit('join_org', activeOrgId);
@@ -77,24 +214,12 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
       fetchRiders();
     });
 
-    return () => {
-      newSocket.disconnect();
-    };
-  }, [activeOrgId]);
-
-  // We use a separate useEffect for the socket listener that depends on loggedInRiderId
-  // so that the notification only fires if it's FOR the logged-in rider.
-  useEffect(() => {
-    const newSocket = io('http://localhost:5001');
-    newSocket.on('connect', () => {
-      newSocket.emit('join_org', activeOrgId);
-    });
-
     newSocket.on('own_rider_assigned', (data: any) => {
       console.log('[Simulator WebSockets] Received offer:', data);
       
+      const currentLoggedInRiderId = loggedInRiderIdRef.current;
       // ONLY trigger if the assigned rider is currently logged in!
-      if (loggedInRiderId && data.riderId === loggedInRiderId) {
+      if (currentLoggedInRiderId && data.riderId === currentLoggedInRiderId) {
         if ('Notification' in window && Notification.permission === 'granted') {
           new Notification(`New Order for ${data.riderName}`, {
             body: `Order #${data.orderId.substring(18)} assigned via ${data.strategy}.`,
@@ -114,7 +239,7 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
     return () => {
       newSocket.disconnect();
     };
-  }, [activeOrgId, loggedInRiderId]);
+  }, [activeOrgId]);
 
   const handleToggleDuty = async (riderId: string, currentDuty: boolean) => {
     try {
@@ -140,21 +265,49 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
     }
   };
 
-  const handleUpdateLocation = async (riderId: string) => {
+
+
+  const handleUpdateLocation = async (riderId: string, directLat?: number, directLng?: number) => {
     const coords = gpsForm[riderId];
-    if (!coords) return;
+    if (!coords && directLat === undefined) return;
 
     try {
+      const lat = directLat ?? parseFloat(coords.lat);
+      const lng = directLng ?? parseFloat(coords.lng);
+      
+      // Find the active delivery for this rider to get the tripId
+      const activeTrip = deliveriesRef.current.find(d => 
+        d.ownRiderAssignment?.riderId?.toString() === riderId.toString() && 
+        ['ASSIGNED', 'RIDER_EN_ROUTE_TO_PICKUP', 'ARRIVED_AT_PICKUP', 'IN_TRIP'].includes(d.status)
+      );
+
+      // Emit to WebSocket for Live Tracking and Geo triggers IMMEDIATELY
+      if (socketRef.current) {
+        console.log('[Simulator] Emitting rider:location:', { riderId, lat, lng, tripId: activeTrip?._id });
+        socketRef.current.emit('rider:location', {
+          riderId,
+          lat,
+          lng,
+          heading: 0,
+          speed: 15,
+          tripId: activeTrip?._id
+        });
+      }
+
+      // Update Database
       await api.post('/rider/app/location', {
         riderId,
-        latitude: parseFloat(coords.lat),
-        longitude: parseFloat(coords.lng)
+        latitude: lat,
+        longitude: lng
       });
+
       fetchRiders();
-      alert('Location updated successfully!');
+      if (directLat === undefined) {
+        alert('Location updated successfully!');
+      }
     } catch (err) {
       console.error(err);
-      alert('Failed to update location');
+      if (directLat === undefined) alert('Failed to update location');
     }
   };
 
@@ -411,20 +564,99 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
                 />
               </div>
             </div>
-            <Button
-              variant="secondary"
-              onClick={() => handleUpdateLocation(r._id)}
-              className="w-full font-bold"
-            >
-              Update GPS Coordinates
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                variant="secondary"
+                onClick={() => handleUpdateLocation(r._id)}
+                className="flex-1 font-bold"
+              >
+                Update GPS manually
+              </Button>
+              <Button
+                variant={autoDriveRiderId === r._id ? "default" : "outline"}
+                onClick={() => setAutoDriveRiderId(autoDriveRiderId === r._id ? null : r._id)}
+                className={`font-bold ${autoDriveRiderId === r._id ? 'bg-blue-600 hover:bg-blue-700 text-white animate-pulse' : ''}`}
+              >
+                {autoDriveRiderId === r._id ? 'Stop Live Tracking' : 'Start Live Tracking'}
+              </Button>
+            </div>
+            
+            {/* Embedded Live Map */}
+            <div className="mt-4 rounded-xl overflow-hidden border shadow-sm relative z-0 h-[200px]">
+              {(() => {
+                const activeDelivery = deliveries.find(d => 
+                  d.ownRiderAssignment?.riderId?.toString() === r._id.toString() && 
+                  ['ASSIGNED', 'RIDER_EN_ROUTE_TO_PICKUP', 'ARRIVED_AT_PICKUP', 'IN_TRIP'].includes(d.status)
+                );
+                const currentStatus = activeDelivery?.status || 'idle';
+                const iconToUse = riderIcons[currentStatus] || riderIcons.idle;
+                const centerLat = parseFloat(gps.lat) || 13.0418;
+                const centerLng = parseFloat(gps.lng) || 80.2341;
+                
+                let targetLat: number | null = null;
+                let targetLng: number | null = null;
+                if (currentStatus === 'RIDER_EN_ROUTE_TO_PICKUP' && activeDelivery) {
+                   targetLat = activeDelivery.pickup.latitude;
+                   targetLng = activeDelivery.pickup.longitude;
+                } else if (currentStatus === 'IN_TRIP' && activeDelivery) {
+                   targetLat = activeDelivery.drop.latitude;
+                   targetLng = activeDelivery.drop.longitude;
+                }
+                
+                let distStr = '--';
+                let etaStr = '--';
+                if (targetLat !== null && targetLng !== null) {
+                   const etaInfo = etaData[r._id];
+                   if (etaInfo) {
+                     distStr = etaInfo.dist;
+                     etaStr = etaInfo.eta;
+                   } else {
+                     distStr = 'Calc...';
+                     etaStr = 'Calc...';
+                   }
+                }
+                
+                return (
+                  <div className="relative w-full h-full">
+                    <MapContainer 
+                      center={[centerLat, centerLng]} 
+                      zoom={15} 
+                      scrollWheelZoom={false} 
+                      style={{ height: '100%', width: '100%', zIndex: 0 }}
+                      zoomControl={false}
+                    >
+                      <TileLayer
+                        attribution='&copy; OpenStreetMap'
+                        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                      />
+                      <MapUpdater center={[centerLat, centerLng]} />
+                      <Marker position={[centerLat, centerLng]} icon={iconToUse} />
+                    </MapContainer>
+                    
+                    {/* Overlay ETA Box (always visible) */}
+                    {(targetLat !== null && targetLng !== null) && (
+                       <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-white/95 backdrop-blur-sm px-4 py-2 rounded-xl shadow-lg border border-primary/20 z-[1000] text-center min-w-[180px]">
+                          <div className="font-extrabold text-[10px] text-primary uppercase tracking-widest mb-1.5">
+                            {currentStatus === 'RIDER_EN_ROUTE_TO_PICKUP' ? 'HEADING TO STORE' : 'HEADING TO CUSTOMER'}
+                          </div>
+                          <div className="flex items-center justify-between text-xs font-bold text-slate-700">
+                            <span className="flex-1">{distStr}</span>
+                            <span className="text-slate-300 mx-2">•</span>
+                            <span className="flex-1 text-emerald-600">{etaStr}</span>
+                          </div>
+                       </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
           </div>
 
           {/* Active Jobs Journey */}
           {(() => {
             const riderActiveDeliveries = deliveries.filter(d => 
               d.ownRiderAssignment?.riderId?.toString() === r._id.toString() && 
-              ['pending', 'rider_assigned', 'at_pickup', 'picked'].includes(d.status)
+              ['ASSIGNED', 'RIDER_EN_ROUTE_TO_PICKUP', 'ARRIVED_AT_PICKUP', 'IN_TRIP'].includes(d.status)
             );
 
             if (riderActiveDeliveries.length === 0) return null;
@@ -434,7 +666,7 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
                 <div className="text-xs font-bold text-muted-foreground uppercase tracking-widest">Active Jobs Journey</div>
                 <div className="space-y-3">
                   {riderActiveDeliveries.map(d => {
-                    if (d.status === 'pending') {
+                    if (d.status === 'ASSIGNED') {
                       return (
                         <div key={d._id} className="p-3.5 rounded-xl bg-secondary/50 border space-y-3">
                           <div className="flex justify-between items-center text-sm">
@@ -466,13 +698,13 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
 
                     let btnText = '';
                     let nextStatus = '';
-                    if (d.status === 'rider_assigned') {
+                    if (d.status === 'RIDER_EN_ROUTE_TO_PICKUP') {
                       btnText = 'Reached Store';
                       nextStatus = 'at_pickup';
-                    } else if (d.status === 'at_pickup') {
+                    } else if (d.status === 'ARRIVED_AT_PICKUP') {
                       btnText = 'Pick Package';
                       nextStatus = 'picked';
-                    } else if (d.status === 'picked') {
+                    } else if (d.status === 'IN_TRIP') {
                       btnText = 'Mark Delivered';
                       nextStatus = 'delivered';
                     }
@@ -482,7 +714,7 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
                         <div className="flex justify-between items-center text-sm">
                           <span className="font-mono text-primary font-bold">#{d._id.substring(18).toUpperCase()}</span>
                           <span className="capitalize font-bold text-muted-foreground">
-                            {d.status === 'rider_assigned' ? 'Rider Assigned' : d.status === 'at_pickup' ? 'At Store' : 'In Transit'}
+                            {d.status === 'RIDER_EN_ROUTE_TO_PICKUP' ? 'Rider Assigned' : d.status === 'ARRIVED_AT_PICKUP' ? 'At Store' : 'In Transit'}
                           </span>
                         </div>
                         <div className="text-xs text-muted-foreground space-y-1 pb-2">
@@ -518,7 +750,7 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
                 {(() => {
                   const pastDeliveries = deliveries.filter(d => 
                     d.ownRiderAssignment?.riderId?.toString() === r._id.toString() && 
-                    ['delivered', 'cancelled', 'picked'].includes(d.status)
+                    ['COMPLETED', 'CANCELLED'].includes(d.status)
                   );
                   if (pastDeliveries.length === 0) {
                     return <div className="text-center text-sm text-muted-foreground py-4">No past deliveries found.</div>;
@@ -527,7 +759,7 @@ export default function RiderSimulatorPage({ activeOrgId }: RiderSimulatorPagePr
                     <div key={d._id} className="p-3 rounded-lg bg-secondary/30 border text-sm flex flex-col gap-1.5">
                       <div className="flex justify-between items-center">
                         <span className="font-mono font-bold text-foreground">#{d._id.substring(18).toUpperCase()}</span>
-                        <span className={`font-semibold capitalize ${d.status === 'delivered' ? 'text-emerald-500' : 'text-red-500'}`}>
+                        <span className={`font-semibold capitalize ${d.status === 'COMPLETED' ? 'text-emerald-500' : 'text-red-500'}`}>
                           {d.status}
                         </span>
                       </div>

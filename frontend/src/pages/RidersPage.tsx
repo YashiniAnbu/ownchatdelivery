@@ -130,8 +130,8 @@ export default function RidersPage({ activeOrgId }: RidersPageProps) {
     }
   };
 
-  const filteredRiders = riders.filter(r => 
-    r.name.toLowerCase().includes(search.toLowerCase()) || 
+  const filteredRiders = riders.filter(r =>
+    r.name.toLowerCase().includes(search.toLowerCase()) ||
     r.phone.includes(search)
   );
 
@@ -142,12 +142,12 @@ export default function RidersPage({ activeOrgId }: RidersPageProps) {
           <h2 className="text-3xl font-bold tracking-tight text-foreground">Fleet Management</h2>
           <p className="text-muted-foreground mt-1 text-sm">Manage your riders, vehicles, and operational status.</p>
         </div>
-        
+
         <Dialog open={isDialogOpen} onOpenChange={(open) => {
           setIsDialogOpen(open);
           if (!open) resetForm();
         }}>
-          <DialogTrigger>
+          <DialogTrigger asChild>
             <Button onClick={handleOpenCreate} className="gap-2">
               <Plus size={16} /> Add New Rider
             </Button>
@@ -162,7 +162,7 @@ export default function RidersPage({ activeOrgId }: RidersPageProps) {
                   <AlertCircle size={16} /> {formError}
                 </div>
               )}
-              
+
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="name">Full Name <span className="text-destructive">*</span></Label>
@@ -172,7 +172,7 @@ export default function RidersPage({ activeOrgId }: RidersPageProps) {
                   <Label htmlFor="phone">Phone Number (10 digits) <span className="text-destructive">*</span></Label>
                   <Input id="phone" required value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g, '').slice(0, 10))} maxLength={10} placeholder="e.g. 9876543210" />
                 </div>
-                
+
                 <div className="space-y-2">
                   <Label htmlFor="vehicleType">Vehicle Type <span className="text-destructive">*</span></Label>
                   <Select value={vehicleType} onValueChange={(val: any) => setVehicleType(val)}>
@@ -190,12 +190,12 @@ export default function RidersPage({ activeOrgId }: RidersPageProps) {
                   <Label htmlFor="vehicleNumber">Registration Number <span className="text-destructive">*</span></Label>
                   <Input id="vehicleNumber" required value={vehicleNumber} onChange={e => setVehicleNumber(e.target.value.toUpperCase())} placeholder="e.g. TN-01-AB-1234" />
                 </div>
-                
+
                 <div className="space-y-2 col-span-2">
                   <Label htmlFor="address">Address <span className="text-destructive">*</span></Label>
                   <Input id="address" required value={address} onChange={e => setAddress(e.target.value)} placeholder="Full Address" />
                 </div>
-                
+
                 <div className="space-y-2">
                   <Label htmlFor="licenseNo">License No</Label>
                   <Input id="licenseNo" value={licenseNo} onChange={e => setLicenseNo(e.target.value)} placeholder="License Number" />
@@ -212,7 +212,7 @@ export default function RidersPage({ activeOrgId }: RidersPageProps) {
                   )}
                 </div>
               </div>
-              
+
               <div className="pt-2 flex justify-end gap-2">
                 <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)}>Cancel</Button>
                 <Button type="submit">{isEditing ? 'Save Changes' : 'Create Rider'}</Button>
@@ -337,19 +337,19 @@ export default function RidersPage({ activeOrgId }: RidersPageProps) {
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex justify-end gap-1">
-                          <Button 
-                            variant="ghost" 
-                            size="icon" 
-                            onClick={() => handleOpenEdit(rider)} 
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => handleOpenEdit(rider)}
                             className="h-8 w-8 text-blue-500 hover:text-blue-600 hover:bg-blue-50"
                             title="Edit Profile"
                           >
                             <Edit2 className="h-4 w-4" />
                           </Button>
-                          <Button 
-                            variant="ghost" 
-                            size="icon" 
-                            onClick={() => handleDelete(rider._id, rider.name)} 
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => handleDelete(rider._id, rider.name)}
                             className="h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10"
                             title="Delete Rider"
                           >
@@ -360,9 +360,9 @@ export default function RidersPage({ activeOrgId }: RidersPageProps) {
                     </TableRow>
                   ))
                 )}
-                </TableBody>
-              </Table>
-            </div>
+              </TableBody>
+            </Table>
+          </div>
         </CardContent>
       </Card>
     </div>

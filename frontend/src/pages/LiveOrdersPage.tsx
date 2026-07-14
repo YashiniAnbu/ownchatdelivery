@@ -20,16 +20,26 @@ export default function LiveOrdersPage({ activeOrgId }: LiveOrdersPageProps) {
   const [loading, setLoading] = useState(true);
   const [selectedDelivery, setSelectedDelivery] = useState<IDelivery | null>(null);
   const [assignModalOpen, setAssignModalOpen] = useState(false);
+  const [allowStaffManual, setAllowStaffManual] = useState(true);
+  const [orgStrategy, setOrgStrategy] = useState('hybrid');
+
+  // Check if current user is admin
+  const currentUserStr = localStorage.getItem('user');
+  const currentUser = currentUserStr ? JSON.parse(currentUserStr) : null;
+  const isAdmin = currentUser?.role === 'owner';
 
   const fetchOrdersAndRiders = async () => {
     if (!activeOrgId) return;
     try {
-      const [delRes, riderRes] = await Promise.all([
+      const [delRes, riderRes, orgRes] = await Promise.all([
         api.get(`/delivery?orgId=${activeOrgId}`),
-        api.get(`/rider/list?orgId=${activeOrgId}`)
+        api.get(`/rider/list?orgId=${activeOrgId}`),
+        api.get(`/org/${activeOrgId}`)
       ]);
       setDeliveries(delRes.data);
       setRiders(riderRes.data);
+      setAllowStaffManual(orgRes.data.ownRiderConfig?.allowStaffManualAssignment ?? true);
+      setOrgStrategy(orgRes.data.ownRiderConfig?.assignmentStrategy || 'hybrid');
     } catch (err) {
       console.error('Failed to fetch orders or riders:', err);
     } finally {
@@ -55,10 +65,15 @@ export default function LiveOrdersPage({ activeOrgId }: LiveOrdersPageProps) {
       fetchOrdersAndRiders();
       if (data?.status && data?.orderId) {
         const orderIdShort = data.orderId.substring(18).toUpperCase();
-        let statusMsg = data.status;
-        if (data.status === 'at_pickup') statusMsg = 'At Store';
-        if (data.status === 'picked') statusMsg = 'Picked Up';
-        if (data.status === 'delivered') statusMsg = 'Delivered';
+        const statusLabels: Record<string, string> = {
+          'ASSIGNED': 'Rider Assigned',
+          'RIDER_EN_ROUTE_TO_PICKUP': 'En Route to Store',
+          'ARRIVED_AT_PICKUP': 'At Store',
+          'IN_TRIP': 'Picked Up',
+          'COMPLETED': 'Delivered',
+          'CANCELLED': 'Cancelled'
+        };
+        const statusMsg = statusLabels[data.status] || data.status;
         toast.info(`Order #${orderIdShort} status changed to ${statusMsg}`);
       }
     });
@@ -117,15 +132,15 @@ export default function LiveOrdersPage({ activeOrgId }: LiveOrdersPageProps) {
 
   const columns = [
     { status: 'unassigned' as const, title: 'Order Created', color: 'text-amber-500', bgColor: 'bg-amber-500/10', borderCls: 'border-amber-500/20' },
-    { status: 'pending' as const, title: 'Rider Assigned', color: 'text-blue-500', bgColor: 'bg-blue-500/10', borderCls: 'border-blue-500/20' },
-    { status: 'rider_assigned' as const, title: 'Rider Reached Store', color: 'text-purple-500', bgColor: 'bg-purple-500/10', borderCls: 'border-purple-500/20' },
-    { status: 'delivered' as const, title: 'Delivered', color: 'text-emerald-500', bgColor: 'bg-emerald-500/10', borderCls: 'border-emerald-500/20' }
+    { status: 'ASSIGNED' as const, title: 'Rider Assigned', color: 'text-blue-500', bgColor: 'bg-blue-500/10', borderCls: 'border-blue-500/20' },
+    { status: 'RIDER_EN_ROUTE_TO_PICKUP' as const, title: 'Rider En Route / At Store', color: 'text-purple-500', bgColor: 'bg-purple-500/10', borderCls: 'border-purple-500/20' },
+    { status: 'COMPLETED' as const, title: 'Delivered', color: 'text-emerald-500', bgColor: 'bg-emerald-500/10', borderCls: 'border-emerald-500/20' }
   ];
 
   // Helper to map DB statuses to our columns
   const getColumnDeliveries = (colStatus: string) => {
-    if (colStatus === 'rider_assigned') {
-      return deliveries.filter(d => ['rider_assigned', 'at_pickup', 'picked'].includes(d.status));
+    if (colStatus === 'RIDER_EN_ROUTE_TO_PICKUP') {
+      return deliveries.filter(d => ['RIDER_EN_ROUTE_TO_PICKUP', 'ARRIVED_AT_PICKUP', 'IN_TRIP'].includes(d.status));
     }
     return deliveries.filter(d => d.status === colStatus);
   };
@@ -163,7 +178,7 @@ export default function LiveOrdersPage({ activeOrgId }: LiveOrdersPageProps) {
 
               {/* Column Cards */}
               <div className={`flex-1 overflow-y-auto space-y-3 pr-1 ${
-                (col.status === 'unassigned' || col.status === 'delivered') 
+                (col.status === 'unassigned' || col.status === 'COMPLETED') 
                   ? '[&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]' 
                   : ''
               }`}>
@@ -174,14 +189,18 @@ export default function LiveOrdersPage({ activeOrgId }: LiveOrdersPageProps) {
                   </div>
                 ) : (
                   colDeliveries.map((delivery) => {
-                    const statusText = delivery.status === 'at_pickup' 
-                      ? 'At Store' 
-                      : delivery.status === 'picked' 
-                        ? 'Parcel In-Transit' 
-                        : delivery.status.replace('_', ' ');
+                    const statusText = {
+                      'ASSIGNED': 'Rider Assigned',
+                      'RIDER_EN_ROUTE_TO_PICKUP': 'En Route',
+                      'ARRIVED_AT_PICKUP': 'At Store',
+                      'IN_TRIP': 'In Transit',
+                      'COMPLETED': 'Delivered',
+                      'CANCELLED': 'Cancelled',
+                      'unassigned': 'Unassigned'
+                    }[delivery.status] || delivery.status;
 
                     return (
-                      <Card key={delivery._id} className={`select-none shadow-sm border-border ${delivery.slaBreached ? 'border-red-500/50 shadow-red-500/20' : ''}`}>
+                      <Card key={delivery._id} className={`select-none shadow-sm border-border ${delivery.sla?.slaBreached ? 'border-red-500/50 shadow-red-500/20' : ''}`}>
                         <CardContent className="p-4 space-y-3">
                           <div className="flex justify-between items-start">
                             <span className="font-mono text-[10px] text-primary font-bold uppercase tracking-wider">
@@ -189,15 +208,15 @@ export default function LiveOrdersPage({ activeOrgId }: LiveOrdersPageProps) {
                             </span>
                             <div className="flex flex-col items-end gap-1">
                               <Badge variant="outline" className={`text-[8px] font-bold uppercase tracking-wider ${
-                                delivery.status === 'delivered' 
+                                delivery.status === 'COMPLETED' 
                                   ? 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20' 
-                                  : delivery.status === 'cancelled' 
+                                  : delivery.status === 'CANCELLED' 
                                     ? 'bg-red-500/10 text-red-600 border-red-500/20'
                                     : 'bg-primary/10 text-primary border-primary/20'
                               }`}>
                                 {statusText}
                               </Badge>
-                              {delivery.slaBreached && (
+                              {delivery.sla?.slaBreached && (
                                 <Badge className="text-[8px] font-bold uppercase tracking-wider bg-red-500 text-white animate-pulse">
                                   SLA Breach
                                 </Badge>
@@ -240,7 +259,7 @@ export default function LiveOrdersPage({ activeOrgId }: LiveOrdersPageProps) {
                           )}
 
                           {/* Footer Action buttons */}
-                          {delivery.status === 'unassigned' && (
+                          {delivery.status === 'unassigned' && (isAdmin || allowStaffManual) && (
                             <Button
                               variant="outline"
                               size="sm"
@@ -270,6 +289,7 @@ export default function LiveOrdersPage({ activeOrgId }: LiveOrdersPageProps) {
           }}
           delivery={selectedDelivery}
           riders={riders}
+          orgStrategy={orgStrategy}
           onConfirm={handleAssignRider}
         />
       )}

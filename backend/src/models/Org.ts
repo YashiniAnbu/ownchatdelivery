@@ -18,6 +18,7 @@ const orgSchema = new Schema<IOrg>({
       default: 'hybrid'
     },
     maxConcurrentOrdersPerRider: { type: Number, default: 3 },
+    allowStaffManualAssignment: { type: Boolean, default: true },
     riderAcceptanceTimeoutMinutes: { type: Number, default: 5 },
     pickupTimeoutMinutes: { type: Number, default: 20 },
     deliveryTimeoutMinutes: { type: Number, default: 45 },

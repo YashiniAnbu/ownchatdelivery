@@ -281,7 +281,7 @@ export default function AuditLogsPage() {
 
               <div>
                 <span className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Metadata</span>
-                <div className="bg-slate-900 text-slate-300 p-4 rounded-xl overflow-x-auto text-xs font-mono border shadow-inner">
+                <div className="bg-slate-900 text-slate-300 p-4 rounded-xl overflow-x-auto overflow-y-auto max-h-[40vh] text-xs font-mono border shadow-inner">
                   <pre>{JSON.stringify(selectedLog.metadata, null, 2)}</pre>
                 </div>
               </div>
